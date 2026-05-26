@@ -108,3 +108,85 @@ fn stdout_has_only_table_output_on_success() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn sorts_entries_by_size_ascending() {
+    let dir = temp_dir("sort-asc");
+    fs::write(dir.join("small.txt"), [0_u8; 1]).unwrap();
+    fs::write(dir.join("large.txt"), [0_u8; 10]).unwrap();
+    fs::create_dir(dir.join("medium")).unwrap();
+    fs::write(dir.join("medium").join("file.bin"), [0_u8; 5]).unwrap();
+
+    let output = rll_command()
+        .args(["--o", "asc"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: Vec<_> = stdout.lines().skip(1).take(3).collect();
+    assert_eq!(
+        rows,
+        [
+            "FILE  1 B        small.txt",
+            "DIR   5 B        medium",
+            "FILE  10 B       large.txt"
+        ]
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn sorts_entries_by_size_descending() {
+    let dir = temp_dir("sort-desc");
+    fs::write(dir.join("small.txt"), [0_u8; 1]).unwrap();
+    fs::write(dir.join("large.txt"), [0_u8; 10]).unwrap();
+    fs::create_dir(dir.join("medium")).unwrap();
+    fs::write(dir.join("medium").join("file.bin"), [0_u8; 5]).unwrap();
+
+    let output = rll_command()
+        .args(["--o", "desc"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: Vec<_> = stdout.lines().skip(1).take(3).collect();
+    assert_eq!(
+        rows,
+        [
+            "FILE  10 B       large.txt",
+            "DIR   5 B        medium",
+            "FILE  1 B        small.txt"
+        ]
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rejects_invalid_order_option() {
+    let output = rll_command().args(["--o", "bad"]).output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: --o requires asc or desc\n"
+    );
+}

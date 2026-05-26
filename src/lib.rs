@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::env;
 use std::fmt;
 use std::fs::{self, DirEntry, FileType, ReadDir};
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -11,7 +13,7 @@ const HEADER: &str = "TYPE  SIZE       NAME\n";
 pub fn run_stdio() -> u8 {
     let stdout = io::stdout();
     let stderr = io::stderr();
-    run(stdout.lock(), stderr.lock())
+    run_with_args(env::args().skip(1), stdout.lock(), stderr.lock())
 }
 
 pub fn run<W, E>(stdout: W, stderr: E) -> u8
@@ -19,17 +21,35 @@ where
     W: Write,
     E: Write,
 {
-    run_path(".", stdout, stderr)
+    run_with_args(std::iter::empty::<&str>(), stdout, stderr)
 }
 
-fn run_path<P, W, E>(path: P, stdout: W, mut stderr: E) -> u8
+pub fn run_with_args<I, S, W, E>(args: I, stdout: W, mut stderr: E) -> u8
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    W: Write,
+    E: Write,
+{
+    let options = match Options::parse(args) {
+        Ok(options) => options,
+        Err(err) => {
+            let _ = writeln!(stderr, "error: {err}");
+            return 1;
+        }
+    };
+
+    run_path(".", options, stdout, stderr)
+}
+
+fn run_path<P, W, E>(path: P, options: Options, stdout: W, mut stderr: E) -> u8
 where
     P: AsRef<Path>,
     W: Write,
     E: Write,
 {
     match fs::read_dir(path) {
-        Ok(entries) => write_entries(stdout, &mut stderr, entries),
+        Ok(entries) => write_entries(stdout, &mut stderr, entries, options),
         Err(err) => {
             let _ = writeln!(stderr, "error: cannot read current directory: {err}");
             1
@@ -39,6 +59,52 @@ where
 
 pub fn format_size(bytes: u64) -> String {
     Size(bytes).to_string()
+}
+
+#[derive(Clone, Copy, Default)]
+struct Options {
+    order: Option<SortOrder>,
+}
+
+impl Options {
+    fn parse<I, S>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut options = Self::default();
+        let mut args = args.into_iter();
+
+        while let Some(arg) = args.next() {
+            match arg.as_ref() {
+                "--o" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--o requires asc or desc".to_owned())?;
+                    options.order = Some(SortOrder::parse(value.as_ref())?);
+                }
+                unknown => return Err(format!("unknown option: {unknown}")),
+            }
+        }
+
+        Ok(options)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "asc" => Ok(Self::Asc),
+            "desc" => Ok(Self::Desc),
+            _ => Err("--o requires asc or desc".to_owned()),
+        }
+    }
 }
 
 struct Size(u64);
@@ -58,7 +124,7 @@ impl fmt::Display for Size {
     }
 }
 
-fn write_entries<W, E>(stdout: W, stderr: &mut E, entries: ReadDir) -> u8
+fn write_entries<W, E>(stdout: W, stderr: &mut E, entries: ReadDir, options: Options) -> u8
 where
     W: Write,
     E: Write,
@@ -66,10 +132,16 @@ where
     let start = Instant::now();
     let mut summary = Summary::default();
     let mut out = BufWriter::new(stdout);
+    let mut rows = Vec::new();
     let mut dir_jobs = Vec::new();
 
     if let Err(err) = out.write_all(HEADER.as_bytes()) {
         return write_error_code(err);
+    }
+    if options.order.is_some() {
+        if let Err(err) = out.flush() {
+            return write_error_code(err);
+        }
     }
 
     for entry_result in entries {
@@ -90,7 +162,10 @@ where
             "FILE" => {
                 summary.files += 1;
                 let size = file_size(&item.path);
-                if let Err(err) = write_item_row(&mut out, &item, &size) {
+                let row = OutputRow::new(item, size);
+                if options.order.is_some() {
+                    rows.push(row);
+                } else if let Err(err) = write_item_row(&mut out, &row) {
                     return write_error_code(err);
                 }
             }
@@ -100,7 +175,10 @@ where
             }
             _ => {
                 summary.others += 1;
-                if let Err(err) = write_item_row(&mut out, &item, "?") {
+                let row = OutputRow::unknown(item);
+                if options.order.is_some() {
+                    rows.push(row);
+                } else if let Err(err) = write_item_row(&mut out, &row) {
                     return write_error_code(err);
                 }
             }
@@ -112,8 +190,20 @@ where
             let _ = writeln!(stderr, "{warning}");
         }
 
-        if let Err(err) = write_item_row(&mut out, &result.item, &format_size(result.size)) {
+        let row = OutputRow::new(result.item, Some(result.size));
+        if options.order.is_some() {
+            rows.push(row);
+        } else if let Err(err) = write_item_row(&mut out, &row) {
             return write_error_code(err);
+        }
+    }
+
+    if let Some(order) = options.order {
+        rows.sort_by(|left, right| compare_rows(left, right, order));
+        for row in rows {
+            if let Err(err) = write_item_row(&mut out, &row) {
+                return write_error_code(err);
+            }
         }
     }
 
@@ -168,6 +258,25 @@ struct DirectoryResult {
     warnings: Vec<String>,
 }
 
+struct OutputRow {
+    item: EntryItem,
+    size: Option<u64>,
+}
+
+impl OutputRow {
+    fn new(item: EntryItem, size: Option<u64>) -> Self {
+        Self { item, size }
+    }
+
+    fn unknown(item: EntryItem) -> Self {
+        Self { item, size: None }
+    }
+
+    fn display_size(&self) -> String {
+        self.size.map(format_size).unwrap_or_else(|| "?".to_owned())
+    }
+}
+
 #[derive(Default)]
 struct Summary {
     files: u64,
@@ -181,22 +290,33 @@ impl Summary {
     }
 }
 
-fn write_item_row<W>(out: &mut W, item: &EntryItem, size: &str) -> io::Result<()>
+fn write_item_row<W>(out: &mut W, row: &OutputRow) -> io::Result<()>
 where
     W: Write,
 {
     writeln!(
         out,
         "{type_name:<5} {size:<10} {name}",
-        type_name = item.type_name,
-        name = item.name
+        type_name = row.item.type_name,
+        size = row.display_size(),
+        name = row.item.name
     )
 }
 
-fn file_size(path: &Path) -> String {
-    match fs::metadata(path) {
-        Ok(metadata) => format_size(metadata.len()),
-        Err(_) => "?".to_owned(),
+fn file_size(path: &Path) -> Option<u64> {
+    fs::metadata(path).map(|metadata| metadata.len()).ok()
+}
+
+fn compare_rows(left: &OutputRow, right: &OutputRow, order: SortOrder) -> Ordering {
+    let left_key = left.size.unwrap_or(u64::MAX);
+    let right_key = right.size.unwrap_or(u64::MAX);
+    let ordering = left_key
+        .cmp(&right_key)
+        .then_with(|| left.item.name.cmp(&right.item.name));
+
+    match order {
+        SortOrder::Asc => ordering,
+        SortOrder::Desc => ordering.reverse(),
     }
 }
 
@@ -359,7 +479,7 @@ fn write_error_code(err: io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_size, run_path};
+    use super::{format_size, run_path, Options};
     use std::io::{self, Write};
 
     struct FailingWriter(io::ErrorKind);
@@ -394,6 +514,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = run_path(
             "path-that-should-not-exist-for-rll-test",
+            Options::default(),
             Vec::new(),
             &mut stderr,
         );
@@ -406,14 +527,24 @@ mod tests {
 
     #[test]
     fn broken_pipe_returns_exit_code_zero() {
-        let code = run_path(".", FailingWriter(io::ErrorKind::BrokenPipe), Vec::new());
+        let code = run_path(
+            ".",
+            Options::default(),
+            FailingWriter(io::ErrorKind::BrokenPipe),
+            Vec::new(),
+        );
 
         assert_eq!(code, 0);
     }
 
     #[test]
     fn non_broken_pipe_write_error_returns_exit_code_one() {
-        let code = run_path(".", FailingWriter(io::ErrorKind::Other), Vec::new());
+        let code = run_path(
+            ".",
+            Options::default(),
+            FailingWriter(io::ErrorKind::Other),
+            Vec::new(),
+        );
 
         assert_eq!(code, 1);
     }
