@@ -1,8 +1,8 @@
-# Spec: rls - Rust ls
+# Spec: rll - Rust lightweight ls
 
 ## 1. Mục tiêu
 
-Xây dựng CLI app native tên `rls` (`rust ls`) để liệt kê tất cả file và thư mục ở vị trí hiện tại, kèm kích thước từng mục.
+Xây dựng CLI app native tên `rll` (`rust lightweight ls`) để liệt kê tất cả file và thư mục ở vị trí hiện tại, kèm kích thước từng mục.
 
 Ưu tiên theo thứ tự:
 
@@ -85,11 +85,13 @@ Output mặc định dạng bảng text:
 TYPE  SIZE       NAME
 FILE  120 B      a.txt
 DIR   4.0 KiB    src
+TOTAL 2 entries (1 files, 1 dirs, 0 other) in 1.234 ms
 ```
 
 Yêu cầu:
 
 - Mỗi entry một dòng.
+- Dòng cuối in tổng số entry đã quét, số file, số thư mục, số loại khác, và thời gian quét.
 - Không in thêm log thừa.
 - Không dùng màu mặc định để tránh overhead và giúp output dễ pipe.
 - Tên file giữ nguyên, không normalize không cần thiết.
@@ -242,7 +244,7 @@ Không panic với lỗi filesystem thường gặp.
 Command dự kiến:
 
 ```bash
-rls
+rll
 ```
 
 Output stdout chứa danh sách file/folder.
@@ -275,7 +277,7 @@ Command gợi ý:
 
 ```bash
 cargo build --release
-hyperfine './target/release/rls'
+hyperfine './target/release/rll'
 ```
 
 Nếu không có `hyperfine`, dùng `time` trước, chưa cần thêm tool.
