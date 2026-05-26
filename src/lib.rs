@@ -1,7 +1,9 @@
 use std::fmt;
 use std::fs::{self, DirEntry, FileType, ReadDir};
 use std::io::{self, BufWriter, ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const HEADER: &str = "TYPE  SIZE       NAME\n";
@@ -64,6 +66,7 @@ where
     let start = Instant::now();
     let mut summary = Summary::default();
     let mut out = BufWriter::new(stdout);
+    let mut dir_jobs = Vec::new();
 
     if let Err(err) = out.write_all(HEADER.as_bytes()) {
         return write_error_code(err);
@@ -78,7 +81,38 @@ where
             }
         };
 
-        if let Err(err) = write_entry(&mut out, stderr, &entry, &mut summary) {
+        let item = match EntryItem::from_entry(entry, stderr) {
+            Some(item) => item,
+            None => continue,
+        };
+
+        match item.type_name {
+            "FILE" => {
+                summary.files += 1;
+                let size = file_size(&item.path);
+                if let Err(err) = write_item_row(&mut out, &item, &size) {
+                    return write_error_code(err);
+                }
+            }
+            "DIR" => {
+                summary.dirs += 1;
+                dir_jobs.push(item);
+            }
+            _ => {
+                summary.others += 1;
+                if let Err(err) = write_item_row(&mut out, &item, "?") {
+                    return write_error_code(err);
+                }
+            }
+        }
+    }
+
+    for result in scan_directories_parallel(dir_jobs) {
+        for warning in result.warnings {
+            let _ = writeln!(stderr, "{warning}");
+        }
+
+        if let Err(err) = write_item_row(&mut out, &result.item, &format_size(result.size)) {
             return write_error_code(err);
         }
     }
@@ -91,6 +125,47 @@ where
         Ok(()) => 0,
         Err(err) => write_error_code(err),
     }
+}
+
+struct EntryItem {
+    path: PathBuf,
+    name: String,
+    type_name: &'static str,
+}
+
+impl EntryItem {
+    fn from_entry<E>(entry: DirEntry, stderr: &mut E) -> Option<Self>
+    where
+        E: Write,
+    {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                let _ = writeln!(
+                    stderr,
+                    "warning: cannot read file type for {:?}: {err}",
+                    entry.file_name()
+                );
+                return Some(Self {
+                    path: entry.path(),
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    type_name: "OTHER",
+                });
+            }
+        };
+
+        Some(Self {
+            path: entry.path(),
+            name: entry.file_name().to_string_lossy().into_owned(),
+            type_name: entry_type(file_type),
+        })
+    }
+}
+
+struct DirectoryResult {
+    item: EntryItem,
+    size: u64,
+    warnings: Vec<String>,
 }
 
 #[derive(Default)]
@@ -106,46 +181,133 @@ impl Summary {
     }
 }
 
-fn write_entry<W, E>(
-    out: &mut W,
-    stderr: &mut E,
-    entry: &DirEntry,
-    summary: &mut Summary,
-) -> io::Result<()>
+fn write_item_row<W>(out: &mut W, item: &EntryItem, size: &str) -> io::Result<()>
 where
     W: Write,
-    E: Write,
 {
-    let type_name = match entry.file_type() {
-        Ok(file_type) => {
-            let type_name = entry_type(file_type);
-            match type_name {
-                "FILE" => summary.files += 1,
-                "DIR" => summary.dirs += 1,
-                _ => summary.others += 1,
-            }
-            type_name
-        }
-        Err(err) => {
-            let _ = writeln!(
-                stderr,
-                "warning: cannot read file type for {:?}: {err}",
-                entry.file_name()
-            );
-            summary.others += 1;
-            "OTHER"
-        }
-    };
+    writeln!(
+        out,
+        "{type_name:<5} {size:<10} {name}",
+        type_name = item.type_name,
+        name = item.name
+    )
+}
 
-    let size = match entry.metadata() {
+fn file_size(path: &Path) -> String {
+    match fs::metadata(path) {
         Ok(metadata) => format_size(metadata.len()),
         Err(_) => "?".to_owned(),
-    };
+    }
+}
 
-    let name = entry.file_name();
-    let name = name.to_string_lossy();
+fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
 
-    writeln!(out, "{type_name:<5} {size:<10} {name}")
+    let worker_count = worker_count().min(jobs.len());
+    let jobs = Arc::new(Mutex::new(jobs.into_iter()));
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let jobs = Arc::clone(&jobs);
+        let result_tx = result_tx.clone();
+        workers.push(thread::spawn(move || loop {
+            let item = {
+                let mut jobs = jobs.lock().unwrap();
+                jobs.next()
+            };
+
+            let Some(item) = item else {
+                break;
+            };
+
+            let mut warnings = Vec::new();
+            let size = directory_size(item.path.clone(), &mut warnings);
+            if result_tx
+                .send(DirectoryResult {
+                    item,
+                    size,
+                    warnings,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }));
+    }
+
+    drop(result_tx);
+
+    let mut results = Vec::new();
+    for result in result_rx {
+        results.push(result);
+    }
+
+    for worker in workers {
+        let _ = worker.join();
+    }
+
+    results
+}
+
+fn worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get() / 2)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn directory_size(path: PathBuf, warnings: &mut Vec<String>) -> u64 {
+    let mut total = 0_u64;
+    let mut stack = vec![path];
+
+    // Use explicit stack so deep trees cannot overflow the call stack.
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warnings.push(format!("warning: cannot read directory {:?}: {err}", dir));
+                continue;
+            }
+        };
+
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.push(format!("warning: cannot read directory entry: {err}"));
+                    continue;
+                }
+            };
+
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    warnings.push(format!(
+                        "warning: cannot read file type for {:?}: {err}",
+                        entry.path()
+                    ));
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                match entry.metadata() {
+                    Ok(metadata) => total = total.saturating_add(metadata.len()),
+                    Err(err) => warnings.push(format!(
+                        "warning: cannot read metadata for {:?}: {err}",
+                        entry.path()
+                    )),
+                }
+            }
+        }
+    }
+
+    total
 }
 
 fn write_summary<W>(out: &mut W, summary: Summary, elapsed: Duration) -> io::Result<()>

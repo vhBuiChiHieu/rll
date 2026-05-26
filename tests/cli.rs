@@ -58,11 +58,14 @@ fn lists_direct_files_and_directories() {
 }
 
 #[test]
-fn does_not_list_nested_entries() {
-    let dir = temp_dir("nonrecursive");
+fn shows_recursive_directory_size_without_listing_nested_entries() {
+    let dir = temp_dir("dir-size");
     let nested = dir.join("nested");
+    let child_dir = nested.join("child");
     fs::create_dir(&nested).unwrap();
-    fs::write(nested.join("child.txt"), b"hidden from mvp").unwrap();
+    fs::create_dir(&child_dir).unwrap();
+    fs::write(nested.join("file.bin"), [0_u8; 10]).unwrap();
+    fs::write(child_dir.join("child.bin"), [0_u8; 20]).unwrap();
 
     let output = rll_command().current_dir(&dir).output().unwrap();
 
@@ -75,10 +78,11 @@ fn does_not_list_nested_entries() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.lines().any(|line| line.ends_with(" nested")),
+        stdout.lines().any(|line| line == "DIR   30 B       nested"),
         "stdout: {stdout}"
     );
-    assert!(!stdout.contains("child.txt"), "stdout: {stdout}");
+    assert!(!stdout.contains("file.bin"), "stdout: {stdout}");
+    assert!(!stdout.contains("child.bin"), "stdout: {stdout}");
 
     fs::remove_dir_all(dir).unwrap();
 }
