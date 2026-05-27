@@ -37,6 +37,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - `--o asc|desc` sorts direct entries by computed size ascending/descending.
 - Invalid `--o` values exit non-zero and print `error: --o requires asc or desc` to stderr.
 - Access-denied nested directories are skipped with stderr warnings; elevated terminal may reduce warnings on Windows.
+- Final `TOTAL` summary counts every entry visited by the recursive scan (direct entries plus everything under each direct directory), not just direct children. `entries` stays equal to `files + dirs + other`.
 
 ## Architecture
 
@@ -62,13 +63,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - Use `DirEntry::file_type()` for `FILE`/`DIR`/`OTHER`.
 - Use metadata for size; never read file contents.
 - Keep stdout parseable: table rows plus final `TOTAL ... in ...` summary.
+- Recursive `TOTAL` counts are aggregated in `ScanState` via per-type `AtomicU64` counters (`nested_files`, `nested_dirs`, `nested_others`) updated with `Relaxed` ordering by workers, then folded into the top-level `Summary` after `scan_directories_parallel` returns. Nested entries whose `DirEntry::file_type()` fails emit a warning and are skipped (not counted), matching pre-existing nested error handling; top-level filetype failures still count as `OTHER`.
 - Use stderr only for warnings/errors.
 - Treat stdout `BrokenPipe` as success exit code `0`.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (134 symbols, 290 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (148 symbols, 318 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

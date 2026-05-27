@@ -188,7 +188,14 @@ where
         }
     }
 
-    for result in scan_directories_parallel(dir_jobs) {
+    let scan = scan_directories_parallel(dir_jobs);
+    // Fold nested counts into the summary so the final line reports every entry
+    // touched during the recursive scan, not just direct children.
+    summary.files += scan.nested.files;
+    summary.dirs += scan.nested.dirs;
+    summary.others += scan.nested.others;
+
+    for result in scan.results {
         for warning in result.warnings {
             let _ = writeln!(stderr, "{warning}");
         }
@@ -360,13 +367,32 @@ struct ScanState {
     cv: Condvar,
     // Per-job total updated lock-free by workers as they sum file sizes.
     totals: Vec<AtomicU64>,
+    // Aggregate nested entry counts across all jobs; feeds the final recursive summary.
+    nested_files: AtomicU64,
+    nested_dirs: AtomicU64,
+    nested_others: AtomicU64,
     // Per-job warning bucket; only locked when a worker has warnings to flush.
     warnings: Mutex<Vec<Vec<String>>>,
 }
 
-fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
+#[derive(Default, Clone, Copy)]
+struct NestedCounts {
+    files: u64,
+    dirs: u64,
+    others: u64,
+}
+
+struct ParallelScan {
+    results: Vec<DirectoryResult>,
+    nested: NestedCounts,
+}
+
+fn scan_directories_parallel(jobs: Vec<EntryItem>) -> ParallelScan {
     if jobs.is_empty() {
-        return Vec::new();
+        return ParallelScan {
+            results: Vec::new(),
+            nested: NestedCounts::default(),
+        };
     }
 
     let job_count = jobs.len();
@@ -389,6 +415,9 @@ fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
         }),
         cv: Condvar::new(),
         totals,
+        nested_files: AtomicU64::new(0),
+        nested_dirs: AtomicU64::new(0),
+        nested_others: AtomicU64::new(0),
         warnings: Mutex::new(warnings_buckets),
     });
 
@@ -413,16 +442,24 @@ fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
         .into_iter()
         .map(|atomic| atomic.into_inner())
         .collect();
+    let nested = NestedCounts {
+        files: state.nested_files.into_inner(),
+        dirs: state.nested_dirs.into_inner(),
+        others: state.nested_others.into_inner(),
+    };
 
     let mut totals_iter = totals.into_iter();
     let mut warnings_iter = warnings.into_iter();
-    jobs.into_iter()
+    let results = jobs
+        .into_iter()
         .map(|item| DirectoryResult {
             item,
             size: totals_iter.next().expect("totals aligned with jobs"),
             warnings: warnings_iter.next().expect("warnings aligned with jobs"),
         })
-        .collect()
+        .collect();
+
+    ParallelScan { results, nested }
 }
 
 fn worker_loop(state: Arc<ScanState>) {
@@ -449,21 +486,36 @@ fn worker_loop(state: Arc<ScanState>) {
         };
 
         let job_id = task.job_id;
-        let (local_total, new_subdirs, local_warnings) = scan_one_level(task);
+        let level = scan_one_level(task);
 
-        if local_total > 0 {
-            state.totals[job_id].fetch_add(local_total, AtomicOrdering::Relaxed);
+        if level.total_size > 0 {
+            state.totals[job_id].fetch_add(level.total_size, AtomicOrdering::Relaxed);
         }
-        if !local_warnings.is_empty() {
+        if level.files > 0 {
+            state
+                .nested_files
+                .fetch_add(level.files, AtomicOrdering::Relaxed);
+        }
+        if level.dirs > 0 {
+            state
+                .nested_dirs
+                .fetch_add(level.dirs, AtomicOrdering::Relaxed);
+        }
+        if level.others > 0 {
+            state
+                .nested_others
+                .fetch_add(level.others, AtomicOrdering::Relaxed);
+        }
+        if !level.warnings.is_empty() {
             let mut warnings = state.warnings.lock().unwrap();
-            warnings[job_id].extend(local_warnings);
+            warnings[job_id].extend(level.warnings);
         }
 
         let mut inner = state.inner.lock().unwrap();
         inner.active -= 1;
-        let pushed = !new_subdirs.is_empty();
+        let pushed = !level.subdirs.is_empty();
         if pushed {
-            inner.queue.extend(new_subdirs);
+            inner.queue.extend(level.subdirs);
             // Wake idle workers to steal the newly discovered subdirs.
             state.cv.notify_all();
         } else if inner.active == 0 && inner.queue.is_empty() {
@@ -473,8 +525,20 @@ fn worker_loop(state: Arc<ScanState>) {
     }
 }
 
-fn scan_one_level(task: ScanTask) -> (u64, Vec<ScanTask>, Vec<String>) {
+struct LevelScan {
+    total_size: u64,
+    files: u64,
+    dirs: u64,
+    others: u64,
+    subdirs: Vec<ScanTask>,
+    warnings: Vec<String>,
+}
+
+fn scan_one_level(task: ScanTask) -> LevelScan {
     let mut total = 0_u64;
+    let mut files = 0_u64;
+    let mut dirs = 0_u64;
+    let mut others = 0_u64;
     // Pre-size subdir buffer to skip the first few Vec growth reallocs on dense dirs;
     // warnings stay default-sized because they are rare on a healthy filesystem.
     let mut subdirs = Vec::with_capacity(8);
@@ -487,7 +551,14 @@ fn scan_one_level(task: ScanTask) -> (u64, Vec<ScanTask>, Vec<String>) {
                 "warning: cannot read directory {:?}: {err}",
                 task.path
             ));
-            return (0, subdirs, warnings);
+            return LevelScan {
+                total_size: 0,
+                files: 0,
+                dirs: 0,
+                others: 0,
+                subdirs,
+                warnings,
+            };
         }
     };
 
@@ -514,11 +585,13 @@ fn scan_one_level(task: ScanTask) -> (u64, Vec<ScanTask>, Vec<String>) {
         };
 
         if file_type.is_dir() {
+            dirs += 1;
             subdirs.push(ScanTask {
                 job_id: task.job_id,
                 path: entry.path(),
             });
         } else if file_type.is_file() {
+            files += 1;
             match entry.metadata() {
                 Ok(metadata) => total = total.saturating_add(metadata.len()),
                 Err(err) => warnings.push(format!(
@@ -526,10 +599,19 @@ fn scan_one_level(task: ScanTask) -> (u64, Vec<ScanTask>, Vec<String>) {
                     entry.path()
                 )),
             }
+        } else {
+            others += 1;
         }
     }
 
-    (total, subdirs, warnings)
+    LevelScan {
+        total_size: total,
+        files,
+        dirs,
+        others,
+        subdirs,
+        warnings,
+    }
 }
 
 fn worker_count() -> usize {
