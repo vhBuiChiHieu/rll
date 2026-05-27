@@ -4,6 +4,12 @@
 
 `rll` is a std-only Rust CLI that lists direct entries in the current directory. It computes recursive sizes for direct directories and prioritizes fast output.
 
+## Toolchain
+
+- Default toolchain: `stable-x86_64-pc-windows-gnullvm` (self-contained; no Visual Studio Build Tools or MinGW required on Windows).
+- `.cargo/config.toml` pins `linker = "rust-lld"` and `rustflags = ["-C", "target-feature=+crt-static"]` so the release binary is statically linked and has no runtime DLL dependencies.
+- First-time setup on a new machine: `rustup toolchain install stable-x86_64-pc-windows-gnullvm && rustup default stable-x86_64-pc-windows-gnullvm`.
+
 ## Commands
 
 ```bash
@@ -59,7 +65,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (120 symbols, 278 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (133 symbols, 290 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
