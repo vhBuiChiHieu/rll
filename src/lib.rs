@@ -4,7 +4,8 @@ use std::fmt;
 use std::fs::{self, DirEntry, FileType, ReadDir};
 use std::io::{self, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -340,56 +341,195 @@ fn compare_rows(left: &OutputRow, right: &OutputRow, order: SortOrder) -> Orderi
     }
 }
 
+struct ScanTask {
+    // Index into the top-level job slice; identifies which directory this work belongs to
+    // so subtree sums and warnings stay attributable after work-stealing.
+    job_id: usize,
+    path: PathBuf,
+}
+
+struct ScanInner {
+    queue: Vec<ScanTask>,
+    active: usize,
+}
+
+struct ScanState {
+    // Single shared deque + Condvar lets idle workers steal subdirs pushed by busy workers,
+    // so one giant top-level dir does not starve the rest of the pool.
+    inner: Mutex<ScanInner>,
+    cv: Condvar,
+    // Per-job total updated lock-free by workers as they sum file sizes.
+    totals: Vec<AtomicU64>,
+    // Per-job warning bucket; only locked when a worker has warnings to flush.
+    warnings: Mutex<Vec<Vec<String>>>,
+}
+
 fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
     if jobs.is_empty() {
         return Vec::new();
     }
 
-    let worker_count = worker_count().min(jobs.len());
-    let jobs = Arc::new(Mutex::new(jobs.into_iter()));
-    let (result_tx, result_rx) = mpsc::channel();
+    let job_count = jobs.len();
+    let mut initial_queue = Vec::with_capacity(job_count);
+    let mut totals = Vec::with_capacity(job_count);
+    let mut warnings_buckets = Vec::with_capacity(job_count);
+    for (id, item) in jobs.iter().enumerate() {
+        initial_queue.push(ScanTask {
+            job_id: id,
+            path: item.path.clone(),
+        });
+        totals.push(AtomicU64::new(0));
+        warnings_buckets.push(Vec::new());
+    }
+
+    let state = Arc::new(ScanState {
+        inner: Mutex::new(ScanInner {
+            queue: initial_queue,
+            active: 0,
+        }),
+        cv: Condvar::new(),
+        totals,
+        warnings: Mutex::new(warnings_buckets),
+    });
+
+    // Pool can exceed top-level job count because work-stealing generates more tasks
+    // as subdirectories are discovered.
+    let worker_count = worker_count();
     let mut workers = Vec::with_capacity(worker_count);
-
     for _ in 0..worker_count {
-        let jobs = Arc::clone(&jobs);
-        let result_tx = result_tx.clone();
-        workers.push(thread::spawn(move || loop {
-            let item = {
-                let mut jobs = jobs.lock().unwrap();
-                jobs.next()
-            };
-
-            let Some(item) = item else {
-                break;
-            };
-
-            let mut warnings = Vec::new();
-            let size = directory_size(&item.path, &mut warnings);
-            if result_tx
-                .send(DirectoryResult {
-                    item,
-                    size,
-                    warnings,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }));
+        let state = Arc::clone(&state);
+        workers.push(thread::spawn(move || worker_loop(state)));
     }
-
-    drop(result_tx);
-
-    let mut results = Vec::new();
-    for result in result_rx {
-        results.push(result);
-    }
-
     for worker in workers {
         let _ = worker.join();
     }
 
-    results
+    let state = Arc::try_unwrap(state)
+        .ok()
+        .expect("worker threads must release shared state before join returns");
+    let warnings = state.warnings.into_inner().unwrap();
+    let totals: Vec<u64> = state
+        .totals
+        .into_iter()
+        .map(|atomic| atomic.into_inner())
+        .collect();
+
+    let mut totals_iter = totals.into_iter();
+    let mut warnings_iter = warnings.into_iter();
+    jobs.into_iter()
+        .map(|item| DirectoryResult {
+            item,
+            size: totals_iter.next().expect("totals aligned with jobs"),
+            warnings: warnings_iter.next().expect("warnings aligned with jobs"),
+        })
+        .collect()
+}
+
+fn worker_loop(state: Arc<ScanState>) {
+    loop {
+        // Acquire next task or exit cleanly when no work remains and no peer is busy.
+        let task = {
+            let mut inner = state.inner.lock().unwrap();
+            loop {
+                if let Some(task) = inner.queue.pop() {
+                    inner.active += 1;
+                    break Some(task);
+                }
+                if inner.active == 0 {
+                    // Nobody can produce more work; wake any remaining waiters so they exit too.
+                    state.cv.notify_all();
+                    break None;
+                }
+                inner = state.cv.wait(inner).unwrap();
+            }
+        };
+
+        let Some(task) = task else {
+            return;
+        };
+
+        let job_id = task.job_id;
+        let (local_total, new_subdirs, local_warnings) = scan_one_level(task);
+
+        if local_total > 0 {
+            state.totals[job_id].fetch_add(local_total, AtomicOrdering::Relaxed);
+        }
+        if !local_warnings.is_empty() {
+            let mut warnings = state.warnings.lock().unwrap();
+            warnings[job_id].extend(local_warnings);
+        }
+
+        let mut inner = state.inner.lock().unwrap();
+        inner.active -= 1;
+        let pushed = !new_subdirs.is_empty();
+        if pushed {
+            inner.queue.extend(new_subdirs);
+            // Wake idle workers to steal the newly discovered subdirs.
+            state.cv.notify_all();
+        } else if inner.active == 0 && inner.queue.is_empty() {
+            // Last worker finishing with nothing left; let everyone exit.
+            state.cv.notify_all();
+        }
+    }
+}
+
+fn scan_one_level(task: ScanTask) -> (u64, Vec<ScanTask>, Vec<String>) {
+    let mut total = 0_u64;
+    // Pre-size subdir buffer to skip the first few Vec growth reallocs on dense dirs;
+    // warnings stay default-sized because they are rare on a healthy filesystem.
+    let mut subdirs = Vec::with_capacity(8);
+    let mut warnings: Vec<String> = Vec::new();
+
+    let entries = match fs::read_dir(&task.path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warnings.push(format!(
+                "warning: cannot read directory {:?}: {err}",
+                task.path
+            ));
+            return (0, subdirs, warnings);
+        }
+    };
+
+    // Scan a single directory level; subdirs are returned for the shared queue rather
+    // than recursed into locally, so peer workers can steal them.
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                warnings.push(format!("warning: cannot read directory entry: {err}"));
+                continue;
+            }
+        };
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                warnings.push(format!(
+                    "warning: cannot read file type for {:?}: {err}",
+                    entry.path()
+                ));
+                continue;
+            }
+        };
+
+        if file_type.is_dir() {
+            subdirs.push(ScanTask {
+                job_id: task.job_id,
+                path: entry.path(),
+            });
+        } else if file_type.is_file() {
+            match entry.metadata() {
+                Ok(metadata) => total = total.saturating_add(metadata.len()),
+                Err(err) => warnings.push(format!(
+                    "warning: cannot read metadata for {:?}: {err}",
+                    entry.path()
+                )),
+            }
+        }
+    }
+
+    (total, subdirs, warnings)
 }
 
 fn worker_count() -> usize {
@@ -403,61 +543,12 @@ fn worker_count() -> usize {
         }
     }
 
+    // Directory traversal is I/O-bound, so default to the full hardware parallelism
+    // hint instead of half — multiple in-flight directory reads overlap latency on SSDs.
     thread::available_parallelism()
-        .map(|count| count.get() / 2)
+        .map(|count| count.get())
         .unwrap_or(1)
         .max(1)
-}
-
-fn directory_size(path: &Path, warnings: &mut Vec<String>) -> u64 {
-    let mut total = 0_u64;
-    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
-
-    // Use explicit stack so deep trees cannot overflow the call stack.
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                warnings.push(format!("warning: cannot read directory {:?}: {err}", dir));
-                continue;
-            }
-        };
-
-        for entry_result in entries {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    warnings.push(format!("warning: cannot read directory entry: {err}"));
-                    continue;
-                }
-            };
-
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err) => {
-                    warnings.push(format!(
-                        "warning: cannot read file type for {:?}: {err}",
-                        entry.path()
-                    ));
-                    continue;
-                }
-            };
-
-            if file_type.is_dir() {
-                stack.push(entry.path());
-            } else if file_type.is_file() {
-                match entry.metadata() {
-                    Ok(metadata) => total = total.saturating_add(metadata.len()),
-                    Err(err) => warnings.push(format!(
-                        "warning: cannot read metadata for {:?}: {err}",
-                        entry.path()
-                    )),
-                }
-            }
-        }
-    }
-
-    total
 }
 
 fn write_summary<W>(out: &mut W, summary: Summary, elapsed: Duration) -> io::Result<()>

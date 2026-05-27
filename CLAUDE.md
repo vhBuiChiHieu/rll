@@ -24,7 +24,9 @@ cargo build --release
 Perf checks:
 
 ```bash
-rustc scripts/check_perf.rs -O -o target/check_perf.exe
+# `-C linker=rust-lld -C target-feature=+crt-static` mirrors .cargo/config.toml so the
+# script binary is statically linked; without them it exits 0xC0000135 STATUS_DLL_NOT_FOUND on Windows.
+rustc scripts/check_perf.rs -O -C linker=rust-lld -C target-feature=+crt-static -o target/check_perf.exe
 ./target/check_perf.exe ./target/release/rll.exe 10000 5
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.ps1 -Binary target/release/rll.exe -Entries 10000 -Runs 5
 ```
@@ -39,7 +41,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 ## Architecture
 
 - `src/main.rs`: process entrypoint; maps library exit code to `ExitCode`.
-- `src/lib.rs`: arg parsing, direct entry scan, parallel top-level directory sizing, output formatting, summary line, core unit tests.
+- `src/lib.rs`: arg parsing, direct entry scan, parallel work-stealing directory sizing, output formatting, summary line, core unit tests.
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
 - `scripts/check_perf.rs`: std-only wall-time and binary-size check.
 - `scripts/measure_windows.ps1`: Windows peak working-set measurement.
@@ -54,9 +56,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - Preserve fast streaming when no sort option is used; only buffer rows when sorting is requested.
 - When sorted output buffers rows, flush the header before scanning so stderr warnings cannot appear before the table header.
 - Use std-only worker threads for direct directory sizing.
-- Default worker count is half of `thread::available_parallelism()`, minimum `1`. Override with `RLL_WORKERS` env var (positive integer); invalid values fall back to default.
+- Default worker count is `thread::available_parallelism()`, minimum `1` (directory traversal is I/O-bound, so the full hint overlaps read latency better than half). Override with `RLL_WORKERS` env var (positive integer); invalid values fall back to default.
 - Cache per-file size via `DirEntry::metadata().len()` during the top-level scan (stored on `EntryItem.size_hint`); never re-stat the path afterwards. Avoids a redundant syscall on Windows where the size is already in the `FindNextFile` data.
-- Use explicit DFS stack for recursive directory sizing; do not use recursive function calls.
+- Use a single shared work-stealing queue (`Mutex<Vec<ScanTask>>` + `Condvar`) for recursive directory sizing; workers scan one directory level at a time and push discovered subdirs back to the shared queue so peers can steal them. Avoids per-worker DFS stacks where one giant subtree starves the pool.
 - Use `DirEntry::file_type()` for `FILE`/`DIR`/`OTHER`.
 - Use metadata for size; never read file contents.
 - Keep stdout parseable: table rows plus final `TOTAL ... in ...` summary.
@@ -66,7 +68,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (134 symbols, 291 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (134 symbols, 290 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
