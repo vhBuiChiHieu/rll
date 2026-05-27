@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, DirEntry, FileType, ReadDir};
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -65,6 +66,12 @@ pub fn format_size(bytes: u64) -> String {
 #[derive(Clone, Copy, Default)]
 struct Options {
     order: Option<SortOrder>,
+    // Include dotfile entries in top-level listing and recursive sizing.
+    show_all: bool,
+    // Cap the number of rows printed after sorting/collection.
+    top_n: Option<usize>,
+    // Emit NDJSON lines instead of the human table.
+    json: bool,
 }
 
 impl Options {
@@ -84,12 +91,55 @@ impl Options {
                         .ok_or_else(|| "--o requires asc or desc".to_owned())?;
                     options.order = Some(SortOrder::parse(value.as_ref())?);
                 }
+                "--a" | "--all" => {
+                    options.show_all = true;
+                }
+                "--n" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--n requires a positive integer".to_owned())?;
+                    let parsed: usize = value
+                        .as_ref()
+                        .parse()
+                        .map_err(|_| "--n requires a positive integer".to_owned())?;
+                    if parsed == 0 {
+                        return Err("--n requires a positive integer".to_owned());
+                    }
+                    options.top_n = Some(parsed);
+                }
+                "--json" => {
+                    options.json = true;
+                }
                 unknown => return Err(format!("unknown option: {unknown}")),
             }
         }
 
         Ok(options)
     }
+
+    // Stream rows as scanned when no sort or top-N limit is requested; otherwise
+    // buffer everything so we can order and truncate before emitting.
+    fn buffer_rows(&self) -> bool {
+        self.order.is_some() || self.top_n.is_some()
+    }
+
+    // Effective sort order. `--n` without explicit `--o` implies `desc` so the
+    // "top N biggest" reading matches what callers expect from `head` over `du`.
+    // Without this, truncation could drop the directory rows that arrive last
+    // from the recursive scan, leaving the printed table inconsistent with TOTAL.
+    fn effective_order(&self) -> Option<SortOrder> {
+        match (self.order, self.top_n) {
+            (Some(order), _) => Some(order),
+            (None, Some(_)) => Some(SortOrder::Desc),
+            (None, None) => None,
+        }
+    }
+}
+
+// A leading '.' is the cross-platform dotfile convention. Caller passes a borrow
+// of the already-allocated OsStr so this check itself adds no allocation.
+fn is_hidden(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
 }
 
 #[derive(Clone, Copy)]
@@ -135,13 +185,20 @@ where
     let mut out = BufWriter::new(stdout);
     let mut rows = Vec::new();
     let mut dir_jobs = Vec::new();
+    let buffered = options.buffer_rows();
 
-    if let Err(err) = out.write_all(HEADER.as_bytes()) {
-        return write_error_code(err);
-    }
-    if options.order.is_some() {
-        if let Err(err) = out.flush() {
+    // Table mode prints a header before scanning; JSON mode emits nothing
+    // until entries are produced so downstream parsers see only NDJSON.
+    if !options.json {
+        if let Err(err) = out.write_all(HEADER.as_bytes()) {
             return write_error_code(err);
+        }
+        if buffered {
+            // Flush the header up front so stderr warnings cannot land before it
+            // while we collect rows for sorting/truncation.
+            if let Err(err) = out.flush() {
+                return write_error_code(err);
+            }
         }
     }
 
@@ -154,7 +211,14 @@ where
             }
         };
 
-        let item = match EntryItem::from_entry(entry, stderr) {
+        // Single allocation point for the entry name; reused for the hidden-filter
+        // check and threaded into `EntryItem::from_entry` so it is never called twice.
+        let file_name = entry.file_name();
+        if !options.show_all && is_hidden(&file_name) {
+            continue;
+        }
+
+        let item = match EntryItem::from_entry(entry, file_name, stderr) {
             Some(item) => item,
             None => continue,
         };
@@ -166,9 +230,9 @@ where
                 // to avoid a redundant stat/CreateFile syscall per file.
                 let size = item.size_hint;
                 let row = OutputRow::new(item, size);
-                if options.order.is_some() {
+                if buffered {
                     rows.push(row);
-                } else if let Err(err) = write_item_row(&mut out, &row) {
+                } else if let Err(err) = emit_row(&mut out, &row, options.json) {
                     return write_error_code(err);
                 }
             }
@@ -179,16 +243,16 @@ where
             _ => {
                 summary.others += 1;
                 let row = OutputRow::unknown(item);
-                if options.order.is_some() {
+                if buffered {
                     rows.push(row);
-                } else if let Err(err) = write_item_row(&mut out, &row) {
+                } else if let Err(err) = emit_row(&mut out, &row, options.json) {
                     return write_error_code(err);
                 }
             }
         }
     }
 
-    let scan = scan_directories_parallel(dir_jobs);
+    let scan = scan_directories_parallel(dir_jobs, options.show_all);
     // Fold nested counts into the summary so the final line reports every entry
     // touched during the recursive scan, not just direct children.
     summary.files += scan.nested.files;
@@ -201,29 +265,51 @@ where
         }
 
         let row = OutputRow::new(result.item, Some(result.size));
-        if options.order.is_some() {
+        if buffered {
             rows.push(row);
-        } else if let Err(err) = write_item_row(&mut out, &row) {
+        } else if let Err(err) = emit_row(&mut out, &row, options.json) {
             return write_error_code(err);
         }
     }
 
-    if let Some(order) = options.order {
-        rows.sort_by(|left, right| compare_rows(left, right, order));
+    if buffered {
+        if let Some(order) = options.effective_order() {
+            rows.sort_by(|left, right| compare_rows(left, right, order));
+        }
+        // Apply --n after sorting so callers get the "top N by size" pairing.
+        if let Some(limit) = options.top_n {
+            rows.truncate(limit);
+        }
         for row in rows {
-            if let Err(err) = write_item_row(&mut out, &row) {
+            if let Err(err) = emit_row(&mut out, &row, options.json) {
                 return write_error_code(err);
             }
         }
     }
 
-    if let Err(err) = write_summary(&mut out, summary, start.elapsed()) {
+    let summary_result = if options.json {
+        write_summary_json(&mut out, summary, start.elapsed())
+    } else {
+        write_summary(&mut out, summary, start.elapsed())
+    };
+    if let Err(err) = summary_result {
         return write_error_code(err);
     }
 
     match out.flush() {
         Ok(()) => 0,
         Err(err) => write_error_code(err),
+    }
+}
+
+fn emit_row<W>(out: &mut W, row: &OutputRow, json: bool) -> io::Result<()>
+where
+    W: Write,
+{
+    if json {
+        write_json_row(out, row)
+    } else {
+        write_item_row(out, row)
     }
 }
 
@@ -237,7 +323,10 @@ struct EntryItem {
 }
 
 impl EntryItem {
-    fn from_entry<E>(entry: DirEntry, stderr: &mut E) -> Option<Self>
+    // Caller supplies the OsString returned by `DirEntry::file_name()` so we
+    // pay the std-mandated allocation exactly once per entry, regardless of the
+    // hidden-filter check, error-warning paths, or metadata branch.
+    fn from_entry<E>(entry: DirEntry, file_name: std::ffi::OsString, stderr: &mut E) -> Option<Self>
     where
         E: Write,
     {
@@ -247,11 +336,11 @@ impl EntryItem {
                 let _ = writeln!(
                     stderr,
                     "warning: cannot read file type for {:?}: {err}",
-                    entry.file_name()
+                    file_name
                 );
                 return Some(Self {
                     path: entry.path(),
-                    name: entry.file_name().to_string_lossy().into_owned(),
+                    name: file_name.to_string_lossy().into_owned(),
                     type_name: "OTHER",
                     size_hint: None,
                 });
@@ -266,7 +355,7 @@ impl EntryItem {
                     let _ = writeln!(
                         stderr,
                         "warning: cannot read metadata for {:?}: {err}",
-                        entry.file_name()
+                        file_name
                     );
                     None
                 }
@@ -277,7 +366,7 @@ impl EntryItem {
 
         Some(Self {
             path: entry.path(),
-            name: entry.file_name().to_string_lossy().into_owned(),
+            name: file_name.to_string_lossy().into_owned(),
             type_name,
             size_hint,
         })
@@ -373,6 +462,8 @@ struct ScanState {
     nested_others: AtomicU64,
     // Per-job warning bucket; only locked when a worker has warnings to flush.
     warnings: Mutex<Vec<Vec<String>>>,
+    // Mirror of Options::show_all so workers can skip dotfile subtrees too.
+    show_all: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -387,7 +478,7 @@ struct ParallelScan {
     nested: NestedCounts,
 }
 
-fn scan_directories_parallel(jobs: Vec<EntryItem>) -> ParallelScan {
+fn scan_directories_parallel(jobs: Vec<EntryItem>, show_all: bool) -> ParallelScan {
     if jobs.is_empty() {
         return ParallelScan {
             results: Vec::new(),
@@ -419,6 +510,7 @@ fn scan_directories_parallel(jobs: Vec<EntryItem>) -> ParallelScan {
         nested_dirs: AtomicU64::new(0),
         nested_others: AtomicU64::new(0),
         warnings: Mutex::new(warnings_buckets),
+        show_all,
     });
 
     // Pool can exceed top-level job count because work-stealing generates more tasks
@@ -486,7 +578,7 @@ fn worker_loop(state: Arc<ScanState>) {
         };
 
         let job_id = task.job_id;
-        let level = scan_one_level(task);
+        let level = scan_one_level(task, state.show_all);
 
         if level.total_size > 0 {
             state.totals[job_id].fetch_add(level.total_size, AtomicOrdering::Relaxed);
@@ -534,7 +626,7 @@ struct LevelScan {
     warnings: Vec<String>,
 }
 
-fn scan_one_level(task: ScanTask) -> LevelScan {
+fn scan_one_level(task: ScanTask, show_all: bool) -> LevelScan {
     let mut total = 0_u64;
     let mut files = 0_u64;
     let mut dirs = 0_u64;
@@ -572,6 +664,12 @@ fn scan_one_level(task: ScanTask) -> LevelScan {
                 continue;
             }
         };
+
+        // Honor --a by skipping nested dotfile entries too, so reported sizes
+        // and counts match the visible top-level filter.
+        if !show_all && is_hidden(&entry.file_name()) {
+            continue;
+        }
 
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
@@ -648,6 +746,61 @@ where
     )
 }
 
+fn write_json_row<W>(out: &mut W, row: &OutputRow) -> io::Result<()>
+where
+    W: Write,
+{
+    out.write_all(b"{\"type\":\"")?;
+    out.write_all(row.item.type_name.as_bytes())?;
+    out.write_all(b"\",\"name\":")?;
+    write_json_string(out, &row.item.name)?;
+    match row.size {
+        Some(size) => writeln!(out, ",\"size\":{size}}}"),
+        None => writeln!(out, ",\"size\":null}}"),
+    }
+}
+
+fn write_summary_json<W>(out: &mut W, summary: Summary, elapsed: Duration) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        out,
+        "{{\"summary\":{{\"entries\":{},\"files\":{},\"dirs\":{},\"other\":{},\"duration_ns\":{}}}}}",
+        summary.total(),
+        summary.files,
+        summary.dirs,
+        summary.others,
+        elapsed.as_nanos()
+    )
+}
+
+// Minimal JSON string escaper for entry names. Names come through to_string_lossy,
+// so the input is always valid UTF-8; we only escape characters required by RFC 8259.
+fn write_json_string<W>(out: &mut W, value: &str) -> io::Result<()>
+where
+    W: Write,
+{
+    out.write_all(b"\"")?;
+    for ch in value.chars() {
+        match ch {
+            '"' => out.write_all(b"\\\"")?,
+            '\\' => out.write_all(b"\\\\")?,
+            '\n' => out.write_all(b"\\n")?,
+            '\r' => out.write_all(b"\\r")?,
+            '\t' => out.write_all(b"\\t")?,
+            '\u{08}' => out.write_all(b"\\b")?,
+            '\u{0c}' => out.write_all(b"\\f")?,
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32)?,
+            c => {
+                let mut buf = [0_u8; 4];
+                out.write_all(c.encode_utf8(&mut buf).as_bytes())?;
+            }
+        }
+    }
+    out.write_all(b"\"")
+}
+
 fn format_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();
 
@@ -682,7 +835,7 @@ fn write_error_code(err: io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_size, run_path, Options};
+    use super::{format_size, run_path, write_json_string, Options};
     use std::io::{self, Write};
 
     struct FailingWriter(io::ErrorKind);
@@ -738,6 +891,15 @@ mod tests {
         );
 
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn json_string_escapes_required_characters() {
+        let mut buf = Vec::new();
+        write_json_string(&mut buf, "a\"b\\c\nd\te\u{0001}f").unwrap();
+        let actual = String::from_utf8(buf).unwrap();
+        let expected = String::from("\"a\\\"b\\\\c\\nd\\te\\u0001f\"");
+        assert_eq!(actual, expected);
     }
 
     #[test]

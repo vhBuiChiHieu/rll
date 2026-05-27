@@ -35,7 +35,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 
 - Default command scans current directory only and prints direct entries plus final summary.
 - `--o asc|desc` sorts direct entries by computed size ascending/descending.
-- Invalid `--o` values exit non-zero and print `error: --o requires asc or desc` to stderr.
+- `--a` / `--all` includes dotfile entries; without it, names beginning with `.` are skipped at every depth so reported sizes/counts ignore hidden subtrees.
+- `--n N` truncates the printed rows to the first `N` after sorting. When `--o` is omitted, `--n` implies descending size order so the largest entries survive truncation; the `TOTAL` summary still reflects every visited entry.
+- `--json` emits NDJSON: one `{"type":..,"name":..,"size":..}` object per row and a final `{"summary":{..,"duration_ns":..}}` line. Table header and `TOTAL` text are suppressed in this mode.
+- Invalid `--o` values exit non-zero and print `error: --o requires asc or desc` to stderr; invalid `--n` values exit non-zero with `error: --n requires a positive integer`.
 - Access-denied nested directories are skipped with stderr warnings; elevated terminal may reduce warnings on Windows.
 - Final `TOTAL` summary counts every entry visited by the recursive scan (direct entries plus everything under each direct directory), not just direct children. `entries` stays equal to `files + dirs + other`.
 
@@ -70,7 +73,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (148 symbols, 318 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (165 symbols, 355 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
