@@ -54,7 +54,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - Preserve fast streaming when no sort option is used; only buffer rows when sorting is requested.
 - When sorted output buffers rows, flush the header before scanning so stderr warnings cannot appear before the table header.
 - Use std-only worker threads for direct directory sizing.
-- Default worker count is half of `thread::available_parallelism()`, minimum `1`.
+- Default worker count is half of `thread::available_parallelism()`, minimum `1`. Override with `RLL_WORKERS` env var (positive integer); invalid values fall back to default.
+- Cache per-file size via `DirEntry::metadata().len()` during the top-level scan (stored on `EntryItem.size_hint`); never re-stat the path afterwards. Avoids a redundant syscall on Windows where the size is already in the `FindNextFile` data.
 - Use explicit DFS stack for recursive directory sizing; do not use recursive function calls.
 - Use `DirEntry::file_type()` for `FILE`/`DIR`/`OTHER`.
 - Use metadata for size; never read file contents.
@@ -65,7 +66,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (133 symbols, 290 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (134 symbols, 291 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

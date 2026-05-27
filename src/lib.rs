@@ -161,7 +161,9 @@ where
         match item.type_name {
             "FILE" => {
                 summary.files += 1;
-                let size = file_size(&item.path);
+                // Reuse cached metadata captured during directory enumeration
+                // to avoid a redundant stat/CreateFile syscall per file.
+                let size = item.size_hint;
                 let row = OutputRow::new(item, size);
                 if options.order.is_some() {
                     rows.push(row);
@@ -221,6 +223,9 @@ struct EntryItem {
     path: PathBuf,
     name: String,
     type_name: &'static str,
+    // Pre-computed length for files captured while the DirEntry is still alive,
+    // so Windows reuses the FindNextFile data and avoids a per-file stat call.
+    size_hint: Option<u64>,
 }
 
 impl EntryItem {
@@ -240,14 +245,33 @@ impl EntryItem {
                     path: entry.path(),
                     name: entry.file_name().to_string_lossy().into_owned(),
                     type_name: "OTHER",
+                    size_hint: None,
                 });
             }
+        };
+
+        let type_name = entry_type(file_type);
+        let size_hint = if type_name == "FILE" {
+            match entry.metadata() {
+                Ok(metadata) => Some(metadata.len()),
+                Err(err) => {
+                    let _ = writeln!(
+                        stderr,
+                        "warning: cannot read metadata for {:?}: {err}",
+                        entry.file_name()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         Some(Self {
             path: entry.path(),
             name: entry.file_name().to_string_lossy().into_owned(),
-            type_name: entry_type(file_type),
+            type_name,
+            size_hint,
         })
     }
 }
@@ -303,10 +327,6 @@ where
     )
 }
 
-fn file_size(path: &Path) -> Option<u64> {
-    fs::metadata(path).map(|metadata| metadata.len()).ok()
-}
-
 fn compare_rows(left: &OutputRow, right: &OutputRow, order: SortOrder) -> Ordering {
     let left_key = left.size.unwrap_or(u64::MAX);
     let right_key = right.size.unwrap_or(u64::MAX);
@@ -344,7 +364,7 @@ fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
             };
 
             let mut warnings = Vec::new();
-            let size = directory_size(item.path.clone(), &mut warnings);
+            let size = directory_size(&item.path, &mut warnings);
             if result_tx
                 .send(DirectoryResult {
                     item,
@@ -373,15 +393,25 @@ fn scan_directories_parallel(jobs: Vec<EntryItem>) -> Vec<DirectoryResult> {
 }
 
 fn worker_count() -> usize {
+    // Allow operators to override the worker pool size via RLL_WORKERS.
+    // Useful for tuning between SSD (more threads) and HDD (fewer threads).
+    if let Ok(raw) = env::var("RLL_WORKERS") {
+        if let Ok(parsed) = raw.trim().parse::<usize>() {
+            if parsed >= 1 {
+                return parsed;
+            }
+        }
+    }
+
     thread::available_parallelism()
         .map(|count| count.get() / 2)
         .unwrap_or(1)
         .max(1)
 }
 
-fn directory_size(path: PathBuf, warnings: &mut Vec<String>) -> u64 {
+fn directory_size(path: &Path, warnings: &mut Vec<String>) -> u64 {
     let mut total = 0_u64;
-    let mut stack = vec![path];
+    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
 
     // Use explicit stack so deep trees cannot overflow the call stack.
     while let Some(dir) = stack.pop() {
