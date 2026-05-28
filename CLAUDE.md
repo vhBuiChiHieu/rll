@@ -2,12 +2,13 @@
 
 ## Project
 
-`rll` is a std-only Rust CLI that lists direct entries in the current directory. It computes recursive sizes for direct directories and prioritizes fast output.
+`rll` is a Rust CLI that lists direct entries in the current directory. It computes recursive sizes for direct directories and prioritizes fast output. A `tui` subcommand opens an interactive list view powered by `ratatui` + `crossterm` (the only runtime crate deps).
 
 ## Toolchain
 
 - Default toolchain: `stable-x86_64-pc-windows-gnullvm` (self-contained; no Visual Studio Build Tools or MinGW required on Windows).
 - `.cargo/config.toml` pins `linker = "rust-lld"` and `rustflags = ["-C", "target-feature=+crt-static"]` so the release binary is statically linked and has no runtime DLL dependencies.
+- `build.rs` generates empty `ar` stub archives for Windows import libs that the gnullvm self-contained sysroot omits (`advapi32`, `cfgmgr32`, `gdi32`, `msimg32`, `opengl32`, `synchronization`, `winspool`). `crossterm`/`winapi` reference these via `#[link(name = "...")]` but never call into them on our code paths, so empty stubs satisfy `rust-lld` without pulling in MinGW. A future dep that actually calls into one of these DLLs will surface as an "undefined symbol" link error, signaling we need real import libs.
 - First-time setup on a new machine: `rustup toolchain install stable-x86_64-pc-windows-gnullvm && rustup default stable-x86_64-pc-windows-gnullvm`.
 
 ## Commands
@@ -19,6 +20,8 @@ cargo build --release
 ./target/release/rll.exe
 ./target/release/rll.exe --o asc
 ./target/release/rll.exe --o desc
+./target/release/rll.exe tui
+./target/release/rll.exe tui --a
 ```
 
 Perf checks:
@@ -42,17 +45,30 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - Access-denied nested directories are skipped with stderr warnings; elevated terminal may reduce warnings on Windows.
 - Final `TOTAL` summary counts every entry visited by the recursive scan (direct entries plus everything under each direct directory), not just direct children. `entries` stays equal to `files + dirs + other`.
 
+## TUI behavior (`rll tui`)
+
+- Launches a full-screen interactive list. Selection starts on the first row as soon as the first entry streams in; the scan continues in the background and pushes rows into the list via an `mpsc` channel.
+- Layout: `title | header | list | footer`. Title shows `rll  ./` and either `scanning…` or the final entry count. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
+- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Honors `--a`/`--all` for hidden entries; other CLI flags (`--o`, `--n`, `--json`) are not consumed by the TUI path in this phase.
+- Restores raw mode and leaves the alternate screen on normal exit, on `Err`, and on panic (panic hook installed before terminal setup).
+- Warnings collected during the scan are buffered and printed to stderr after the TUI exits, so they never garble the alternate screen.
+- Render is capped to ~30fps and is event-driven: redraw fires only on new scan rows, key/resize events, or scan completion.
+
 ## Architecture
 
 - `src/main.rs`: process entrypoint; maps library exit code to `ExitCode`.
-- `src/lib.rs`: arg parsing, direct entry scan, parallel work-stealing directory sizing, output formatting, summary line, core unit tests.
+- `src/lib.rs`: arg parsing (including the `tui` subcommand), direct entry scan, parallel work-stealing directory sizing, CLI output formatting, summary line, core unit tests. Exposes `EntryItem`, `Summary`, `is_hidden`, `scan_directories_parallel`, `format_size`, `format_duration` as `pub(crate)` so the TUI module can reuse the scan and formatting layer.
+- `src/tui.rs`: ratatui + crossterm interactive mode. Owns the terminal lifecycle (raw mode, alternate screen, panic hook), the background scan thread, the `mpsc` streaming protocol, the ratatui render, and the keyboard event loop.
+- `build.rs`: writes empty `ar` stub archives for gnullvm-missing import libs (see Toolchain).
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
 - `scripts/check_perf.rs`: std-only wall-time and binary-size check.
 - `scripts/measure_windows.ps1`: Windows peak working-set measurement.
 
 ## Constraints
 
-- Runtime dependencies: none.
+- Runtime dependencies (CLI path): none — std-only.
+- Runtime dependencies (TUI path): `ratatui` (with the `crossterm` feature, default features off). No other crate deps; the TUI module reuses the std-only scan layer.
 - Scan only `.`; no path argument in MVP.
 - List only direct entries; never print nested entries.
 - Compute directory size recursively by summing nested file metadata sizes.
@@ -73,7 +89,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (165 symbols, 355 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (184 symbols, 412 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

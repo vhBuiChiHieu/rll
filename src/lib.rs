@@ -10,6 +10,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod tui;
+
 const HEADER: &str = "TYPE  SIZE       NAME\n";
 
 pub fn run_stdio() -> u8 {
@@ -33,15 +35,18 @@ where
     W: Write,
     E: Write,
 {
-    let options = match Options::parse(args) {
-        Ok(options) => options,
+    let parsed = match Options::parse(args) {
+        Ok(parsed) => parsed,
         Err(err) => {
             let _ = writeln!(stderr, "error: {err}");
             return 1;
         }
     };
 
-    run_path(".", options, stdout, stderr)
+    match parsed.mode {
+        Mode::Cli => run_path(".", parsed, stdout, stderr),
+        Mode::Tui => tui::run(parsed.show_all),
+    }
 }
 
 fn run_path<P, W, E>(path: P, options: Options, stdout: W, mut stderr: E) -> u8
@@ -64,6 +69,13 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 #[derive(Clone, Copy, Default)]
+pub(crate) enum Mode {
+    #[default]
+    Cli,
+    Tui,
+}
+
+#[derive(Clone, Copy, Default)]
 struct Options {
     order: Option<SortOrder>,
     // Include dotfile entries in top-level listing and recursive sizing.
@@ -72,6 +84,8 @@ struct Options {
     top_n: Option<usize>,
     // Emit NDJSON lines instead of the human table.
     json: bool,
+    // Subcommand routing; default is the CLI listing path.
+    mode: Mode,
 }
 
 impl Options {
@@ -81,7 +95,15 @@ impl Options {
         S: AsRef<str>,
     {
         let mut options = Self::default();
-        let mut args = args.into_iter();
+        let mut args = args.into_iter().peekable();
+
+        // First positional token before any flag may select the TUI mode.
+        if let Some(first) = args.peek() {
+            if first.as_ref() == "tui" {
+                options.mode = Mode::Tui;
+                let _ = args.next();
+            }
+        }
 
         while let Some(arg) = args.next() {
             match arg.as_ref() {
@@ -138,7 +160,7 @@ impl Options {
 
 // A leading '.' is the cross-platform dotfile convention. Caller passes a borrow
 // of the already-allocated OsStr so this check itself adds no allocation.
-fn is_hidden(name: &OsStr) -> bool {
+pub(crate) fn is_hidden(name: &OsStr) -> bool {
     name.as_encoded_bytes().first() == Some(&b'.')
 }
 
@@ -313,20 +335,24 @@ where
     }
 }
 
-struct EntryItem {
-    path: PathBuf,
-    name: String,
-    type_name: &'static str,
+pub(crate) struct EntryItem {
+    pub(crate) path: PathBuf,
+    pub(crate) name: String,
+    pub(crate) type_name: &'static str,
     // Pre-computed length for files captured while the DirEntry is still alive,
     // so Windows reuses the FindNextFile data and avoids a per-file stat call.
-    size_hint: Option<u64>,
+    pub(crate) size_hint: Option<u64>,
 }
 
 impl EntryItem {
     // Caller supplies the OsString returned by `DirEntry::file_name()` so we
     // pay the std-mandated allocation exactly once per entry, regardless of the
     // hidden-filter check, error-warning paths, or metadata branch.
-    fn from_entry<E>(entry: DirEntry, file_name: std::ffi::OsString, stderr: &mut E) -> Option<Self>
+    pub(crate) fn from_entry<E>(
+        entry: DirEntry,
+        file_name: std::ffi::OsString,
+        stderr: &mut E,
+    ) -> Option<Self>
     where
         E: Write,
     {
@@ -373,10 +399,10 @@ impl EntryItem {
     }
 }
 
-struct DirectoryResult {
-    item: EntryItem,
-    size: u64,
-    warnings: Vec<String>,
+pub(crate) struct DirectoryResult {
+    pub(crate) item: EntryItem,
+    pub(crate) size: u64,
+    pub(crate) warnings: Vec<String>,
 }
 
 struct OutputRow {
@@ -398,15 +424,15 @@ impl OutputRow {
     }
 }
 
-#[derive(Default)]
-struct Summary {
-    files: u64,
-    dirs: u64,
-    others: u64,
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Summary {
+    pub(crate) files: u64,
+    pub(crate) dirs: u64,
+    pub(crate) others: u64,
 }
 
 impl Summary {
-    fn total(&self) -> u64 {
+    pub(crate) fn total(&self) -> u64 {
         self.files + self.dirs + self.others
     }
 }
@@ -467,18 +493,18 @@ struct ScanState {
 }
 
 #[derive(Default, Clone, Copy)]
-struct NestedCounts {
-    files: u64,
-    dirs: u64,
-    others: u64,
+pub(crate) struct NestedCounts {
+    pub(crate) files: u64,
+    pub(crate) dirs: u64,
+    pub(crate) others: u64,
 }
 
-struct ParallelScan {
-    results: Vec<DirectoryResult>,
-    nested: NestedCounts,
+pub(crate) struct ParallelScan {
+    pub(crate) results: Vec<DirectoryResult>,
+    pub(crate) nested: NestedCounts,
 }
 
-fn scan_directories_parallel(jobs: Vec<EntryItem>, show_all: bool) -> ParallelScan {
+pub(crate) fn scan_directories_parallel(jobs: Vec<EntryItem>, show_all: bool) -> ParallelScan {
     if jobs.is_empty() {
         return ParallelScan {
             results: Vec::new(),
@@ -801,7 +827,7 @@ where
     out.write_all(b"\"")
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();
 
     if nanos < 1_000 {
