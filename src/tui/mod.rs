@@ -3,7 +3,6 @@
 
 use std::io::{self, Stdout};
 use std::sync::mpsc;
-use std::thread;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
@@ -18,12 +17,20 @@ mod render;
 mod scan;
 
 use app::App;
-use scan::{scan_into_channel, ScanEvent};
+use scan::ScanEvent;
 
 pub(crate) fn run(show_all: bool) -> u8 {
     // Restore terminal state on panic so a crash never leaves the user in raw mode
     // with the alternate screen still active.
     install_panic_hook();
+
+    let initial_root = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("error: cannot read current directory: {err}");
+            return 1;
+        }
+    };
 
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
@@ -34,15 +41,12 @@ pub(crate) fn run(show_all: bool) -> u8 {
     };
 
     let (tx, rx) = mpsc::channel::<ScanEvent>();
-    let scan_handle = thread::spawn(move || scan_into_channel(tx, show_all));
-
-    let mut app = App::new();
-    let loop_res = event::event_loop(&mut terminal, &mut app, rx);
+    let mut app = App::new(initial_root);
+    let loop_res = event::event_loop(&mut terminal, &mut app, tx, rx, show_all);
 
     // Always restore terminal before printing warnings/errors so they land in the
     // user's normal shell instead of the alternate screen.
     let restore_res = restore_terminal(&mut terminal);
-    let _ = scan_handle.join();
 
     for w in &app.warnings {
         eprintln!("{w}");

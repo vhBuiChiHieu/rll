@@ -1,46 +1,63 @@
 // Background scan thread and the mpsc streaming protocol that feeds the UI.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::app::Row;
 use crate::scan::{is_hidden, scan_directories_parallel, EntryItem, Summary};
 
-// Streaming protocol between background scan thread and UI loop.
 pub(crate) enum ScanEvent {
-    Row(Row),
-    Warning(String),
-    Done(Summary, Duration),
+    Row {
+        scan_id: u64,
+        row: Row,
+    },
+    Warning {
+        scan_id: u64,
+        warning: String,
+    },
+    Done {
+        scan_id: u64,
+        summary: Summary,
+        elapsed: Duration,
+    },
 }
 
-pub(crate) fn scan_into_channel(tx: mpsc::Sender<ScanEvent>, show_all: bool) {
+pub(crate) fn scan_into_channel(
+    tx: mpsc::Sender<ScanEvent>,
+    show_all: bool,
+    path: PathBuf,
+    scan_id: u64,
+) {
     let start = Instant::now();
     let mut summary = Summary::default();
     let mut dir_jobs: Vec<EntryItem> = Vec::new();
 
-    let entries = match std::fs::read_dir(Path::new(".")) {
+    let entries = match std::fs::read_dir(&path) {
         Ok(entries) => entries,
         Err(err) => {
-            let _ = tx.send(ScanEvent::Warning(format!(
-                "error: cannot read current directory: {err}"
-            )));
-            let _ = tx.send(ScanEvent::Done(summary, start.elapsed()));
+            send_warning(
+                &tx,
+                scan_id,
+                format!("error: cannot read {}: {err}", path.display()),
+            );
+            send_done(&tx, scan_id, summary, start.elapsed());
             return;
         }
     };
 
-    // Buffer warnings from EntryItem::from_entry into a Vec<u8> sink, then re-emit as
-    // ScanEvent::Warning so they print to stderr after the TUI exits.
+    // Buffer warnings from EntryItem::from_entry so they print after the TUI exits.
     let mut sink: Vec<u8> = Vec::new();
 
     for entry_result in entries {
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(err) => {
-                let _ = tx.send(ScanEvent::Warning(format!(
-                    "warning: cannot read directory entry: {err}"
-                )));
+                send_warning(
+                    &tx,
+                    scan_id,
+                    format!("warning: cannot read directory entry: {err}"),
+                );
                 continue;
             }
         };
@@ -58,11 +75,16 @@ pub(crate) fn scan_into_channel(tx: mpsc::Sender<ScanEvent>, show_all: bool) {
         match item.type_name {
             "FILE" => {
                 summary.files += 1;
-                let _ = tx.send(ScanEvent::Row(Row {
-                    type_name: item.type_name,
-                    name: item.name,
-                    size: item.size_hint,
-                }));
+                let row_path = path.join(&item.name);
+                let _ = tx.send(ScanEvent::Row {
+                    scan_id,
+                    row: Row {
+                        type_name: item.type_name,
+                        name: item.name,
+                        path: row_path,
+                        size: item.size_hint,
+                    },
+                });
             }
             "DIR" => {
                 summary.dirs += 1;
@@ -70,17 +92,21 @@ pub(crate) fn scan_into_channel(tx: mpsc::Sender<ScanEvent>, show_all: bool) {
             }
             _ => {
                 summary.others += 1;
-                let _ = tx.send(ScanEvent::Row(Row {
-                    type_name: item.type_name,
-                    name: item.name,
-                    size: None,
-                }));
+                let row_path = path.join(&item.name);
+                let _ = tx.send(ScanEvent::Row {
+                    scan_id,
+                    row: Row {
+                        type_name: item.type_name,
+                        name: item.name,
+                        path: row_path,
+                        size: None,
+                    },
+                });
             }
         }
     }
 
-    // Flush buffered top-level warnings.
-    flush_sink_warnings(&tx, sink);
+    flush_sink_warnings(&tx, scan_id, sink);
 
     let scan = scan_directories_parallel(dir_jobs, show_all);
     summary.files += scan.nested.files;
@@ -89,25 +115,42 @@ pub(crate) fn scan_into_channel(tx: mpsc::Sender<ScanEvent>, show_all: bool) {
 
     for result in scan.results {
         for warning in result.warnings {
-            let _ = tx.send(ScanEvent::Warning(warning));
+            send_warning(&tx, scan_id, warning);
         }
-        let _ = tx.send(ScanEvent::Row(Row {
-            type_name: result.item.type_name,
-            name: result.item.name,
-            size: Some(result.size),
-        }));
+        let row_path = path.join(&result.item.name);
+        let _ = tx.send(ScanEvent::Row {
+            scan_id,
+            row: Row {
+                type_name: result.item.type_name,
+                name: result.item.name,
+                path: row_path,
+                size: Some(result.size),
+            },
+        });
     }
 
-    let _ = tx.send(ScanEvent::Done(summary, start.elapsed()));
+    send_done(&tx, scan_id, summary, start.elapsed());
 }
 
-fn flush_sink_warnings(tx: &mpsc::Sender<ScanEvent>, sink: Vec<u8>) {
+fn flush_sink_warnings(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, sink: Vec<u8>) {
     if sink.is_empty() {
         return;
     }
     if let Ok(text) = String::from_utf8(sink) {
         for line in text.lines().filter(|line| !line.is_empty()) {
-            let _ = tx.send(ScanEvent::Warning(line.to_owned()));
+            send_warning(tx, scan_id, line.to_owned());
         }
     }
+}
+
+fn send_warning(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, warning: String) {
+    let _ = tx.send(ScanEvent::Warning { scan_id, warning });
+}
+
+fn send_done(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, summary: Summary, elapsed: Duration) {
+    let _ = tx.send(ScanEvent::Done {
+        scan_id,
+        summary,
+        elapsed,
+    });
 }

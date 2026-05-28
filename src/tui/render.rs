@@ -1,13 +1,15 @@
 // ratatui draw: title | header | list | footer.
 
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use super::app::App;
 use crate::format::{format_duration, format_size};
+
+const KEY_HINT: &str = "↑/↓ navigate · Enter/l open · Backspace/h parent · r reload · q quit";
 
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // Vertical stack: title | header | list | footer.
@@ -24,17 +26,17 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // Cache the list viewport height so PgUp/PgDn track the visible page.
     app.list_height = chunks[2].height as usize;
 
-    // Title.
+    let path = app.current_dir.display().to_string();
     let title = if app.scanning {
         Line::from(vec![
             Span::styled("rll", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  ./  "),
+            Span::raw(format!("  {path}  ")),
             Span::styled("scanning…", Style::default().fg(Color::Yellow)),
         ])
     } else {
         Line::from(vec![
             Span::styled("rll", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  ./  "),
+            Span::raw(format!("  {path}  ")),
             Span::styled(
                 format!("{} entries", app.rows.len()),
                 Style::default().fg(Color::DarkGray),
@@ -105,10 +107,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::Green),
             ),
             Span::raw("   "),
-            Span::styled(
-                "↑/↓ navigate · q quit",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(KEY_HINT, Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
@@ -116,11 +115,40 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
                 format!("{} items… ", app.rows.len()),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::styled(
-                "↑/↓ navigate · q quit",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(KEY_HINT, Style::default().fg(Color::DarkGray)),
         ])
     };
     f.render_widget(Paragraph::new(footer), chunks[3]);
+
+    if app.confirm_leave_root.is_some() {
+        render_leave_root_modal(f);
+    }
+}
+
+fn render_leave_root_modal(f: &mut Frame) {
+    let area = centered_rect(f.area());
+    f.render_widget(Clear, area);
+    let modal = Paragraph::new("Leave initial directory?\ny/Enter confirm · n/Esc cancel")
+        .style(Style::default().fg(Color::Yellow))
+        .block(Block::default().borders(Borders::ALL).title("Confirm"));
+    f.render_widget(modal, area);
+}
+
+fn centered_rect(area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Length(4),
+            Constraint::Percentage(40),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Percentage(70),
+            Constraint::Percentage(15),
+        ])
+        .split(vertical[1])[1]
 }

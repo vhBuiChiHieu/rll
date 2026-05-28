@@ -48,8 +48,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 ## TUI behavior (`rll tui`)
 
 - Launches a full-screen interactive list. Selection starts on the first row as soon as the first entry streams in; the scan continues in the background and pushes rows into the list via an `mpsc` channel.
-- Layout: `title | header | list | footer`. Title shows `rll  ./` and either `scanning…` or the final entry count. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
-- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Layout: `title | header | list | footer`. Title shows `rll  <current path>` and either `scanning…` or the final entry count. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
+- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `Enter/l` open selected directory, `Backspace/h` parent directory, `r` reload current directory, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Parent navigation may leave the launch directory; crossing above the initial root shows an in-TUI confirmation modal (`y`/`Enter` confirm, `n`/`Esc` cancel).
+- Completed directory scans are cached by path for instant revisits; `r` drops the current directory cache entry and scans again.
 - Honors `--a`/`--all` for hidden entries; other CLI flags (`--o`, `--n`, `--json`) are not consumed by the TUI path in this phase.
 - Restores raw mode and leaves the alternate screen on normal exit, on `Err`, and on panic (panic hook installed before terminal setup).
 - Warnings collected during the scan are buffered and printed to stderr after the TUI exits, so they never garble the alternate screen.
@@ -65,11 +67,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - `src/output.rs`: CLI rendering — `run_path`, `write_entries`, table/NDJSON writers, row buffering/sorting/truncation, summary line, JSON string escaper. Owns the CLI-path unit tests.
 - Cross-module reuse: `cli`, `scan`, and `format` items the TUI and output paths share are `pub(crate)`; the TUI submodules import the scan + format layer directly via `crate::scan::*` / `crate::format::*`.
 - `src/tui/`: ratatui + crossterm interactive mode, split into submodules:
-  - `mod.rs`: `pub(crate) run`, terminal lifecycle (raw mode, alternate screen, panic hook), channel + thread wiring.
-  - `app.rs`: `App` UI state, `Row`, and list-selection navigation (`move_*`/`page_*`). No ratatui drawing.
-  - `render.rs`: `render(frame, app)` — the `title | header | list | footer` ratatui layout.
-  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle) and `handle_key` key mapping.
-  - `scan.rs`: `ScanEvent` protocol and `scan_into_channel` background thread bridging `crate::scan` into the UI.
+  - `mod.rs`: `pub(crate) run`, terminal lifecycle (raw mode, alternate screen, panic hook), channel setup, and initial root capture.
+  - `app.rs`: `App` UI state, `Row`, cached directory snapshots, confirm-modal state, and list-selection navigation (`move_*`/`page_*`). No ratatui drawing.
+  - `render.rs`: `render(frame, app)` — the `title | header | list | footer` ratatui layout plus confirmation modal overlay.
+  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle), scan spawning, stale `scan_id` filtering, directory navigation, reload, and key mapping.
+  - `scan.rs`: `ScanEvent` protocol and path-aware `scan_into_channel` background thread bridging `crate::scan` into the UI.
 - `build.rs`: writes empty `ar` stub archives for gnullvm-missing import libs (see Toolchain).
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
 - `scripts/check_perf.rs`: std-only wall-time and binary-size check.
