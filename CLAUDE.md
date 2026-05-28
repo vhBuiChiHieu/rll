@@ -2,7 +2,7 @@
 
 ## Project
 
-`rll` is a Rust CLI that lists direct entries in the current directory. It computes recursive sizes for direct directories and prioritizes fast output. A `tui` subcommand opens an interactive list view powered by `ratatui` + `crossterm` (the only runtime crate deps).
+`rll` is a Rust CLI that lists direct entries in the current directory. It computes recursive sizes for direct directories and prioritizes fast output. A `tui` subcommand opens an interactive list view powered by `ratatui` + `crossterm` with `sysinfo` for process CPU/RAM metrics.
 
 ## Toolchain
 
@@ -48,7 +48,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 ## TUI behavior (`rll tui`)
 
 - Launches a full-screen interactive list. Selection starts on the first row as soon as the first entry streams in; the scan continues in the background and pushes rows into the list via an `mpsc` channel.
-- Layout: `title | header | list | footer`. Title shows `rll  <current path>` and either `scanning…` or the final entry count. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
+- Layout: `title | header | list | system status | footer`. Title shows `rll  <current path>` and either `scanning…` or the final entry count. System status shows process CPU and RAM MB once per second. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
 - Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `Enter/l` open selected directory, `Backspace/h` parent directory, `r` reload current directory, `c` settings, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
 - Settings screen: `Enter`/`Space` cycles values, `s` saves, `Esc` cancels; supports hidden files plus sort field `unsorted|name|size|type` and direction `asc|desc`.
 - TUI settings persist in `%APPDATA%\rll\config` on Windows, `$XDG_CONFIG_HOME/rll/config` or `$HOME/.config/rll/config` elsewhere; `rll tui --a` overrides hidden files for that session only.
@@ -72,8 +72,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - `src/tui/`: ratatui + crossterm interactive mode, split into submodules:
   - `mod.rs`: `pub(crate) run`, terminal lifecycle (raw mode, alternate screen, panic hook), channel setup, and initial root capture.
   - `app.rs`: `App` UI state, `Row`, cached directory snapshots, confirm-modal state, and list-selection navigation (`move_*`/`page_*`). No ratatui drawing.
-  - `render.rs`: `render(frame, app)` — the `title | header | list | footer` ratatui layout plus confirmation modal overlay.
-  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle), scan spawning, stale `scan_id` filtering, directory navigation, reload, and key mapping.
+  - `render.rs`: `render(frame, app)` — the `title | header | list | system status | footer` ratatui layout plus confirmation modal overlay.
+  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle, 1s process CPU/RAM sampling), scan spawning, stale `scan_id` filtering, directory navigation, reload, and key mapping.
   - `scan.rs`: `ScanEvent` protocol and path-aware `scan_into_channel` background thread bridging `crate::scan` into the UI.
 - `build.rs`: writes empty `ar` stub archives for gnullvm-missing import libs (see Toolchain).
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
@@ -87,7 +87,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 ## Constraints
 
 - Runtime dependencies (CLI path): none — std-only.
-- Runtime dependencies (TUI path): `ratatui` (with the `crossterm` feature, default features off). No other crate deps; the TUI module reuses the std-only scan layer.
+- Runtime dependencies (TUI path): `ratatui` (with the `crossterm` feature, default features off) and `sysinfo` for process metrics; the TUI module reuses the std-only scan layer.
 - Scan only `.`; no path argument in MVP.
 - List only direct entries; never print nested entries.
 - Compute directory size recursively by summing nested file metadata sizes.
@@ -108,7 +108,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rll** (284 symbols, 694 relationships, 24 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rll** (361 symbols, 848 relationships, 31 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

@@ -30,6 +30,12 @@ pub(crate) struct ConfirmLeaveRoot {
     pub(crate) target: PathBuf,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SystemStatus {
+    pub(crate) cpu_percent: f32,
+    pub(crate) memory_mb: u64,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ViewMode {
     List,
@@ -71,6 +77,7 @@ pub(crate) struct App {
     pub(crate) view: ViewMode,
     pub(crate) settings_selected: usize,
     pub(crate) status: Option<String>,
+    pub(crate) system_status: SystemStatus,
 }
 
 impl App {
@@ -93,6 +100,7 @@ impl App {
             view: ViewMode::List,
             settings_selected: 0,
             status: None,
+            system_status: SystemStatus::default(),
         }
     }
 

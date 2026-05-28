@@ -1,4 +1,4 @@
-// ratatui draw: title | header | list | footer.
+// ratatui draw: title | header | list | system status | footer.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,13 +21,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_list(f: &mut Frame, app: &mut App) {
-    // Vertical stack: title | header | list | footer.
+    // Vertical stack: title | header | list | system status | footer.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -97,6 +98,18 @@ fn render_list(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, chunks[2], &mut state);
     app.state = state;
 
+    let system_status = Line::from(vec![
+        Span::styled(
+            format!("rll CPU {:.1}% ", app.system_status.cpu_percent),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("· RAM {} MB", app.system_status.memory_mb),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(system_status), chunks[3]);
+
     // Footer.
     let footer = if let Some(status) = &app.status {
         Line::from(vec![
@@ -133,7 +146,7 @@ fn render_list(f: &mut Frame, app: &mut App) {
             Span::styled(KEY_HINT, Style::default().fg(Color::DarkGray)),
         ])
     };
-    f.render_widget(Paragraph::new(footer), chunks[3]);
+    f.render_widget(Paragraph::new(footer), chunks[4]);
 
     if app.confirm_leave_root.is_some() {
         render_leave_root_modal(f);

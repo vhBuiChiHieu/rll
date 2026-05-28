@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
+use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-use super::app::{App, ConfirmLeaveRoot, SettingsAction, ViewMode};
+use super::app::{App, ConfirmLeaveRoot, SettingsAction, SystemStatus, ViewMode};
 use super::render::render;
 use super::scan::{scan_into_channel, ScanEvent};
 
@@ -28,6 +29,7 @@ pub(crate) fn event_loop(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     let mut dirty = true;
+    let mut status_sampler = SystemStatusSampler::new();
 
     loop {
         loop {
@@ -40,6 +42,11 @@ pub(crate) fn event_loop(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
+        }
+
+        if let Some(system_status) = status_sampler.refresh_if_due() {
+            app.system_status = system_status;
+            dirty = true;
         }
 
         if dirty && last_draw.elapsed() >= frame_budget {
@@ -72,6 +79,60 @@ pub(crate) fn event_loop(
             last_draw = Instant::now();
             dirty = false;
         }
+    }
+}
+
+struct SystemStatusSampler {
+    system: System,
+    pid: Option<sysinfo::Pid>,
+    last_update: Instant,
+}
+
+impl SystemStatusSampler {
+    fn new() -> Self {
+        let mut system = System::new();
+        let pid = get_current_pid().ok();
+        if let Some(pid) = pid {
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                true,
+                ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            );
+        }
+
+        Self {
+            system,
+            pid,
+            last_update: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn refresh_if_due(&mut self) -> Option<SystemStatus> {
+        if self.last_update.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
+        self.last_update = Instant::now();
+
+        let Some(pid) = self.pid else {
+            return Some(SystemStatus::default());
+        };
+
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+
+        let Some(process) = self.system.process(pid) else {
+            return Some(SystemStatus::default());
+        };
+
+        Some(SystemStatus {
+            cpu_percent: process.cpu_usage(),
+            memory_mb: process.memory() / (1024 * 1024),
+        })
     }
 }
 
