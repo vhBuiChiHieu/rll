@@ -1,14 +1,16 @@
 # rll
 
-`rll` is a small Rust CLI for listing direct entries in the current directory with file sizes, recursive directory sizes, and a final total.
+`rll` is a small Rust CLI for listing direct entries in the current directory with file sizes, recursive directory sizes, and a final total. It also ships an interactive `tui` subcommand.
 
 ## Features
 
 - Lists only direct entries in the current directory.
-- Computes directory sizes recursively.
+- Computes directory sizes recursively with a parallel work-stealing scan.
 - Streams output by default for fast feedback.
-- Supports size sorting with `--o asc` and `--o desc`.
-- Uses only Rust standard library dependencies.
+- Size sorting with `--o asc` / `--o desc`.
+- Hidden entries via `--a` / `--all`; row cap via `--n N`; machine output via `--json` (NDJSON).
+- Interactive full-screen list via `rll tui`.
+- CLI path is std-only (no crate dependencies); the `tui` path adds `ratatui` + `crossterm`.
 
 ## Install
 
@@ -40,16 +42,34 @@ target/release/rll.exe
 ## Usage
 
 ```bash
-rll
-rll --o asc
-rll --o desc
+rll                 # list direct entries + TOTAL summary
+rll --o asc         # sort by computed size ascending
+rll --o desc        # sort by computed size descending
+rll --a             # include dotfile entries (alias: --all)
+rll --n 20          # cap to first 20 rows (implies desc when --o omitted)
+rll --json          # NDJSON: one object per row + final summary line
+rll tui             # interactive full-screen list
+rll tui --a         # interactive list including dotfiles
 ```
 
-Invalid ordering values exit with a non-zero status and print:
+Invalid option values exit with a non-zero status:
 
 ```text
 error: --o requires asc or desc
+error: --n requires a positive integer
 ```
+
+### TUI keys
+
+| Key | Action |
+|-----|--------|
+| `↑` / `k` | up |
+| `↓` / `j` | down |
+| `Home` / `g` | first |
+| `End` / `G` | last |
+| `PgUp` / `u` | page up |
+| `PgDn` / `d` | page down |
+| `q` / `Esc` / `Ctrl-C` | quit |
 
 ## Release checklist
 

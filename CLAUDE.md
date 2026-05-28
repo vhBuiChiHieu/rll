@@ -58,8 +58,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 ## Architecture
 
 - `src/main.rs`: process entrypoint; maps library exit code to `ExitCode`.
-- `src/lib.rs`: arg parsing (including the `tui` subcommand), direct entry scan, parallel work-stealing directory sizing, CLI output formatting, summary line, core unit tests. Exposes `EntryItem`, `Summary`, `is_hidden`, `scan_directories_parallel`, `format_size`, `format_duration` as `pub(crate)` so the TUI module can reuse the scan and formatting layer.
-- `src/tui.rs`: ratatui + crossterm interactive mode. Owns the terminal lifecycle (raw mode, alternate screen, panic hook), the background scan thread, the `mpsc` streaming protocol, the ratatui render, and the keyboard event loop.
+- `src/lib.rs`: crate root. Holds `run_stdio`/`run`/`run_with_args` entrypoints, declares the modules, and dispatches `Mode::Cli` → `output::run_path` vs `Mode::Tui` → `tui::run`. Re-exports `format_size` as the public API.
+- `src/cli.rs`: arg parsing — `Options`, `SortOrder`, `Mode`, `Options::parse` (including the `tui` subcommand token), `buffer_rows`/`effective_order` policy.
+- `src/scan.rs`: scan engine — `EntryItem`, `DirectoryResult`, `Summary`, `NestedCounts`, `ParallelScan`, `is_hidden`, and the work-stealing `scan_directories_parallel` plus its `ScanState`/`worker_loop`/`scan_one_level`/`worker_count` internals. Std-only; no crate deps.
+- `src/format.rs`: human-readable `format_size` (public) and `format_duration` (`pub(crate)`).
+- `src/output.rs`: CLI rendering — `run_path`, `write_entries`, table/NDJSON writers, row buffering/sorting/truncation, summary line, JSON string escaper. Owns the CLI-path unit tests.
+- Cross-module reuse: `cli`, `scan`, and `format` items the TUI and output paths share are `pub(crate)`; the TUI submodules import the scan + format layer directly via `crate::scan::*` / `crate::format::*`.
+- `src/tui/`: ratatui + crossterm interactive mode, split into submodules:
+  - `mod.rs`: `pub(crate) run`, terminal lifecycle (raw mode, alternate screen, panic hook), channel + thread wiring.
+  - `app.rs`: `App` UI state, `Row`, and list-selection navigation (`move_*`/`page_*`). No ratatui drawing.
+  - `render.rs`: `render(frame, app)` — the `title | header | list | footer` ratatui layout.
+  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle) and `handle_key` key mapping.
+  - `scan.rs`: `ScanEvent` protocol and `scan_into_channel` background thread bridging `crate::scan` into the UI.
 - `build.rs`: writes empty `ar` stub archives for gnullvm-missing import libs (see Toolchain).
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
 - `scripts/check_perf.rs`: std-only wall-time and binary-size check.
