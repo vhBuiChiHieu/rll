@@ -16,6 +16,7 @@ mod event;
 mod render;
 mod scan;
 
+use crate::config::Config;
 use app::App;
 use scan::ScanEvent;
 
@@ -32,6 +33,11 @@ pub(crate) fn run(show_all: bool) -> u8 {
         }
     };
 
+    let (mut config, config_warning) = Config::load();
+    if show_all {
+        config.show_hidden = true;
+    }
+
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(err) => {
@@ -41,8 +47,11 @@ pub(crate) fn run(show_all: bool) -> u8 {
     };
 
     let (tx, rx) = mpsc::channel::<ScanEvent>();
-    let mut app = App::new(initial_root);
-    let loop_res = event::event_loop(&mut terminal, &mut app, tx, rx, show_all);
+    let mut app = App::new(initial_root, config);
+    if let Some(warning) = config_warning {
+        app.warnings.push(warning);
+    }
+    let loop_res = event::event_loop(&mut terminal, &mut app, tx, rx);
 
     // Always restore terminal before printing warnings/errors so they land in the
     // user's normal shell instead of the alternate screen.

@@ -2,6 +2,7 @@ use std::env;
 use std::io::{self, Write};
 
 mod cli;
+mod config;
 mod format;
 mod output;
 mod scan;

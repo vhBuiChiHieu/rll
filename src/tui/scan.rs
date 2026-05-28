@@ -32,6 +32,7 @@ pub(crate) fn scan_into_channel(
     let start = Instant::now();
     let mut summary = Summary::default();
     let mut dir_jobs: Vec<EntryItem> = Vec::new();
+    let mut order = 0;
 
     let entries = match std::fs::read_dir(&path) {
         Ok(entries) => entries,
@@ -76,15 +77,21 @@ pub(crate) fn scan_into_channel(
             "FILE" => {
                 summary.files += 1;
                 let row_path = path.join(&item.name);
-                let _ = tx.send(ScanEvent::Row {
+                let row_order = order;
+                order += 1;
+                if !send_row(
+                    &tx,
                     scan_id,
-                    row: Row {
+                    Row {
                         type_name: item.type_name,
                         name: item.name,
                         path: row_path,
                         size: item.size_hint,
+                        order: row_order,
                     },
-                });
+                ) {
+                    return;
+                }
             }
             "DIR" => {
                 summary.dirs += 1;
@@ -93,15 +100,21 @@ pub(crate) fn scan_into_channel(
             _ => {
                 summary.others += 1;
                 let row_path = path.join(&item.name);
-                let _ = tx.send(ScanEvent::Row {
+                let row_order = order;
+                order += 1;
+                if !send_row(
+                    &tx,
                     scan_id,
-                    row: Row {
+                    Row {
                         type_name: item.type_name,
                         name: item.name,
                         path: row_path,
                         size: None,
+                        order: row_order,
                     },
-                });
+                ) {
+                    return;
+                }
             }
         }
     }
@@ -118,15 +131,21 @@ pub(crate) fn scan_into_channel(
             send_warning(&tx, scan_id, warning);
         }
         let row_path = path.join(&result.item.name);
-        let _ = tx.send(ScanEvent::Row {
+        let row_order = order;
+        order += 1;
+        if !send_row(
+            &tx,
             scan_id,
-            row: Row {
+            Row {
                 type_name: result.item.type_name,
                 name: result.item.name,
                 path: row_path,
                 size: Some(result.size),
+                order: row_order,
             },
-        });
+        ) {
+            return;
+        }
     }
 
     send_done(&tx, scan_id, summary, start.elapsed());
@@ -143,14 +162,24 @@ fn flush_sink_warnings(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, sink: Vec<u8>
     }
 }
 
-fn send_warning(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, warning: String) {
-    let _ = tx.send(ScanEvent::Warning { scan_id, warning });
+fn send_row(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, row: Row) -> bool {
+    tx.send(ScanEvent::Row { scan_id, row }).is_ok()
 }
 
-fn send_done(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, summary: Summary, elapsed: Duration) {
-    let _ = tx.send(ScanEvent::Done {
+fn send_warning(tx: &mpsc::Sender<ScanEvent>, scan_id: u64, warning: String) -> bool {
+    tx.send(ScanEvent::Warning { scan_id, warning }).is_ok()
+}
+
+fn send_done(
+    tx: &mpsc::Sender<ScanEvent>,
+    scan_id: u64,
+    summary: Summary,
+    elapsed: Duration,
+) -> bool {
+    tx.send(ScanEvent::Done {
         scan_id,
         summary,
         elapsed,
-    });
+    })
+    .is_ok()
 }

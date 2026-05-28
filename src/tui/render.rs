@@ -6,12 +6,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::app::App;
+use super::app::{App, SettingsAction, ViewMode, SETTINGS_ACTIONS};
 use crate::format::{format_duration, format_size};
 
-const KEY_HINT: &str = "↑/↓ navigate · Enter/l open · Backspace/h parent · r reload · q quit";
+const KEY_HINT: &str =
+    "↑/↓ navigate · Enter/l open · Backspace/h parent · r reload · c settings · q quit";
+const SETTINGS_HINT: &str = "↑/↓ navigate · Enter/Space change · s save · Esc cancel · q quit";
 
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
+    match app.view {
+        ViewMode::List => render_list(f, app),
+        ViewMode::Settings => render_settings(f, app),
+    }
+}
+
+fn render_list(f: &mut Frame, app: &mut App) {
     // Vertical stack: title | header | list | footer.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -89,7 +98,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     app.state = state;
 
     // Footer.
-    let footer = if let (Some(summary), Some(elapsed)) = (app.summary, app.elapsed) {
+    let footer = if let Some(status) = &app.status {
+        Line::from(vec![
+            Span::styled(status.clone(), Style::default().fg(Color::Green)),
+            Span::raw("   "),
+            Span::styled(KEY_HINT, Style::default().fg(Color::DarkGray)),
+        ])
+    } else if let (Some(summary), Some(elapsed)) = (app.summary, app.elapsed) {
         Line::from(vec![
             Span::styled(
                 format!("TOTAL {} ", summary.total()),
@@ -123,6 +138,74 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     if app.confirm_leave_root.is_some() {
         render_leave_root_modal(f);
     }
+}
+
+fn render_settings(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "rll settings",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {}", app.current_dir.display())),
+        ])),
+        chunks[0],
+    );
+
+    let draft = app.draft_config();
+    let items: Vec<ListItem> = SETTINGS_ACTIONS
+        .iter()
+        .map(|action| {
+            let text = match action {
+                SettingsAction::ShowHidden => format!(
+                    "Show hidden files: {}",
+                    if draft.show_hidden { "on" } else { "off" }
+                ),
+                SettingsAction::SortField => format!("Sort field: {}", draft.sort_field.as_str()),
+                SettingsAction::SortDirection => {
+                    format!("Sort direction: {}", draft.sort_direction.as_str())
+                }
+                SettingsAction::Save => "Save and close".to_owned(),
+                SettingsAction::Cancel => "Cancel".to_owned(),
+            };
+            ListItem::new(Line::from(text))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Config"))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("» ");
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(app.settings_selected));
+    f.render_stateful_widget(list, chunks[1], &mut state);
+
+    let footer = if let Some(status) = &app.status {
+        Line::from(vec![
+            Span::styled(status.clone(), Style::default().fg(Color::Red)),
+            Span::raw("   "),
+            Span::styled(SETTINGS_HINT, Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            SETTINGS_HINT,
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    f.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
 fn render_leave_root_modal(f: &mut Frame) {

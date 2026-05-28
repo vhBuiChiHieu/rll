@@ -49,7 +49,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 
 - Launches a full-screen interactive list. Selection starts on the first row as soon as the first entry streams in; the scan continues in the background and pushes rows into the list via an `mpsc` channel.
 - Layout: `title | header | list | footer`. Title shows `rll  <current path>` and either `scanning…` or the final entry count. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
-- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `Enter/l` open selected directory, `Backspace/h` parent directory, `r` reload current directory, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `Enter/l` open selected directory, `Backspace/h` parent directory, `r` reload current directory, `c` settings, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Settings screen: `Enter`/`Space` cycles values, `s` saves, `Esc` cancels; supports hidden files plus sort field `unsorted|name|size|type` and direction `asc|desc`.
+- TUI settings persist in `%APPDATA%\rll\config` on Windows, `$XDG_CONFIG_HOME/rll/config` or `$HOME/.config/rll/config` elsewhere; `rll tui --a` overrides hidden files for that session only.
 - Parent navigation may leave the launch directory; crossing above the initial root shows an in-TUI confirmation modal (`y`/`Enter` confirm, `n`/`Esc` cancel).
 - Completed directory scans are cached by path for instant revisits; `r` drops the current directory cache entry and scans again.
 - Honors `--a`/`--all` for hidden entries; other CLI flags (`--o`, `--n`, `--json`) are not consumed by the TUI path in this phase.
@@ -62,6 +64,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - `src/main.rs`: process entrypoint; maps library exit code to `ExitCode`.
 - `src/lib.rs`: crate root. Holds `run_stdio`/`run`/`run_with_args` entrypoints, declares the modules, and dispatches `Mode::Cli` → `output::run_path` vs `Mode::Tui` → `tui::run`. Re-exports `format_size` as the public API.
 - `src/cli.rs`: arg parsing — `Options`, `SortOrder`, `Mode`, `Options::parse` (including the `tui` subcommand token), `buffer_rows`/`effective_order` policy.
+- `src/config.rs`: std-only persisted config for TUI settings; line-based key/value format and platform config path resolution.
 - `src/scan.rs`: scan engine — `EntryItem`, `DirectoryResult`, `Summary`, `NestedCounts`, `ParallelScan`, `is_hidden`, and the work-stealing `scan_directories_parallel` plus its `ScanState`/`worker_loop`/`scan_one_level`/`worker_count` internals. Std-only; no crate deps.
 - `src/format.rs`: human-readable `format_size` (public) and `format_duration` (`pub(crate)`).
 - `src/output.rs`: CLI rendering — `run_path`, `write_entries`, table/NDJSON writers, row buffering/sorting/truncation, summary line, JSON string escaper. Owns the CLI-path unit tests.
@@ -76,6 +79,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
 - `scripts/check_perf.rs`: std-only wall-time and binary-size check.
 - `scripts/measure_windows.ps1`: Windows peak working-set measurement.
+
+## Maintenance
+
+- Before committing, check whether recent code changes require syncing `CLAUDE.md`.
 
 ## Constraints
 
