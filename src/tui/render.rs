@@ -9,9 +9,11 @@ use ratatui::Frame;
 use super::app::{App, SettingsAction, ViewMode, SETTINGS_ACTIONS};
 use crate::format::{format_duration, format_size};
 
-const KEY_HINT: &str =
-    "↑/↓ navigate · Enter/l open · Backspace/h parent · r reload · c settings · q quit";
+const KEY_HINT: &str = "↑/↓ nav · Enter open · / filter · o os-open · e reveal · y copy · ⌫ parent · r reload · c cfg · q quit";
 const SETTINGS_HINT: &str = "↑/↓ navigate · Enter/Space change · s save · Esc cancel · q quit";
+const FILTER_HINT: &str = "type to filter · Enter apply · Esc clear";
+// Width of the ncdu-style size graph column, in cells.
+const BAR_WIDTH: usize = 10;
 
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
     match app.view {
@@ -37,6 +39,17 @@ fn render_list(f: &mut Frame, app: &mut App) {
     app.list_height = chunks[2].height as usize;
 
     let path = app.current_dir.display().to_string();
+    // When a filter is active, show how many of the total rows survive it.
+    let count_label = if app.filter_query.is_empty() {
+        format!("{} entries", app.rows.len())
+    } else {
+        format!(
+            "{}/{} match /{}",
+            app.visible.len(),
+            app.rows.len(),
+            app.filter_query
+        )
+    };
     let title = if app.scanning {
         Line::from(vec![
             Span::styled("rll", Style::default().add_modifier(Modifier::BOLD)),
@@ -47,27 +60,47 @@ fn render_list(f: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled("rll", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!("  {path}  ")),
-            Span::styled(
-                format!("{} entries", app.rows.len()),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(count_label, Style::default().fg(Color::DarkGray)),
         ])
     };
     f.render_widget(Paragraph::new(title), chunks[0]);
 
-    // Column header — same column widths as the CLI table.
+    // Column header — TYPE | SIZE | % of total | size graph | NAME.
     let header = Line::from(Span::styled(
-        format!("{:<5} {:<10} {}", "TYPE", "SIZE", "NAME"),
+        format!(
+            "{:<5} {:<10} {:>4} {:<width$} {}",
+            "TYPE",
+            "SIZE",
+            "%",
+            "GRAPH",
+            "NAME",
+            width = BAR_WIDTH
+        ),
         Style::default().add_modifier(Modifier::DIM),
     ));
     f.render_widget(Paragraph::new(header), chunks[1]);
 
-    // Rows.
-    let items: Vec<ListItem> = app
-        .rows
+    // Denominators for the % column (of total) and the bar (relative to the largest
+    // entry, ncdu-style). Computed over the visible set so a filtered view rescales.
+    let total_size: u64 = app.visible.iter().filter_map(|&i| app.rows[i].size).sum();
+    let max_size: u64 = app
+        .visible
         .iter()
-        .map(|r| {
+        .filter_map(|&i| app.rows[i].size)
+        .max()
+        .unwrap_or(0);
+
+    // Rows — iterate the visible projection so `state` selection lines up.
+    let items: Vec<ListItem> = app
+        .visible
+        .iter()
+        .map(|&i| {
+            let r = &app.rows[i];
             let size = r.size.map(format_size).unwrap_or_else(|| "?".to_owned());
+            let (pct, bar) = match r.size {
+                Some(bytes) => (size_percent(bytes, total_size), size_bar(bytes, max_size)),
+                None => ("    ".to_owned(), " ".repeat(BAR_WIDTH)),
+            };
             let type_color = match r.type_name {
                 "DIR" => Color::Cyan,
                 "FILE" => Color::White,
@@ -80,6 +113,10 @@ fn render_list(f: &mut Frame, app: &mut App) {
                 ),
                 Span::raw(" "),
                 Span::styled(format!("{size:<10}"), Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(pct, Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(bar, Style::default().fg(Color::Blue)),
                 Span::raw(" "),
                 Span::raw(r.name.clone()),
             ]))
@@ -110,8 +147,21 @@ fn render_list(f: &mut Frame, app: &mut App) {
     ]);
     f.render_widget(Paragraph::new(system_status), chunks[3]);
 
-    // Footer.
-    let footer = if let Some(status) = &app.status {
+    // Footer. Live filter input takes over the line while the user is typing.
+    let footer = if app.filtering {
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                app.filter_query.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::raw("   "),
+            Span::styled(FILTER_HINT, Style::default().fg(Color::DarkGray)),
+        ])
+    } else if let Some(status) = &app.status {
         Line::from(vec![
             Span::styled(status.clone(), Style::default().fg(Color::Green)),
             Span::raw("   "),
@@ -247,4 +297,30 @@ fn centered_rect(area: Rect) -> Rect {
             Constraint::Percentage(15),
         ])
         .split(vertical[1])[1]
+}
+
+// `bytes` as a percentage of the visible total, right-aligned in 4 cells (e.g. " 62%").
+fn size_percent(bytes: u64, total: u64) -> String {
+    if total == 0 {
+        return "   0".to_owned();
+    }
+    let pct = (bytes as f64 / total as f64 * 100.0).round() as u64;
+    format!("{pct:>3}%")
+}
+
+// Proportional bar relative to the largest visible entry, BAR_WIDTH cells wide.
+fn size_bar(bytes: u64, max: u64) -> String {
+    if max == 0 {
+        return " ".repeat(BAR_WIDTH);
+    }
+    let fill = ((bytes as f64 / max as f64) * BAR_WIDTH as f64).round() as usize;
+    let fill = fill.min(BAR_WIDTH);
+    let mut bar = String::with_capacity(BAR_WIDTH * 3);
+    for _ in 0..fill {
+        bar.push('█');
+    }
+    for _ in fill..BAR_WIDTH {
+        bar.push('░');
+    }
+    bar
 }

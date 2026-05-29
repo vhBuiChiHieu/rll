@@ -78,6 +78,13 @@ pub(crate) struct App {
     pub(crate) settings_selected: usize,
     pub(crate) status: Option<String>,
     pub(crate) system_status: SystemStatus,
+    // Fuzzy filter state. `filtering` is the live-input mode toggled by `/`;
+    // `filter_query` persists after Enter so the list stays filtered.
+    pub(crate) filtering: bool,
+    pub(crate) filter_query: String,
+    // Indices into `rows` (in sorted order) that pass the current filter.
+    // The list view and `state` selection both index into this, not `rows`.
+    pub(crate) visible: Vec<usize>,
 }
 
 impl App {
@@ -101,26 +108,31 @@ impl App {
             settings_selected: 0,
             status: None,
             system_status: SystemStatus::default(),
+            filtering: false,
+            filter_query: String::new(),
+            visible: Vec::new(),
         }
     }
 
     pub(crate) fn push_row(&mut self, row: Row) {
         self.rows.push(row);
         self.apply_sort_preserve_selection();
-        // Select the first row as soon as one arrives so arrow keys work immediately.
-        if self.state.selected().is_none() {
-            self.state.select(Some(0));
-        }
+        // Select the first visible row as soon as one arrives so arrow keys work immediately.
+        self.ensure_selection();
     }
 
     pub(crate) fn begin_scan(&mut self, path: PathBuf) -> u64 {
         self.scan_id = self.scan_id.wrapping_add(1);
         self.current_dir = path;
         self.rows.clear();
+        self.visible.clear();
         self.state = ListState::default();
         self.summary = None;
         self.elapsed = None;
         self.scanning = true;
+        // A fresh scan starts unfiltered; a stale query from the prior dir is meaningless here.
+        self.filtering = false;
+        self.filter_query.clear();
         self.scan_id
     }
 
@@ -150,15 +162,17 @@ impl App {
         self.elapsed = Some(cached.elapsed);
         self.scanning = false;
         self.state = ListState::default();
+        self.filtering = false;
+        self.filter_query.clear();
         self.apply_sort_preserve_selection();
-        if !self.rows.is_empty() {
-            self.state.select(Some(0));
-        }
+        self.ensure_selection();
         true
     }
 
     pub(crate) fn selected_row(&self) -> Option<&Row> {
-        self.state.selected().and_then(|i| self.rows.get(i))
+        let view_index = self.state.selected()?;
+        let row_index = *self.visible.get(view_index)?;
+        self.rows.get(row_index)
     }
 
     pub(crate) fn selected_dir_path(&self) -> Option<PathBuf> {
@@ -239,30 +253,82 @@ impl App {
     }
 
     pub(crate) fn apply_sort_preserve_selection(&mut self) {
-        if self.rows.len() < 2 {
-            return;
+        // Capture the selected row's identity before mutating order/visibility.
+        let selected = self.selected_row().map(row_key);
+
+        if self.rows.len() >= 2 {
+            let field = self.config.sort_field;
+            let direction = self.config.sort_direction;
+            self.rows
+                .sort_by(|left, right| compare_rows(left, right, field, direction));
         }
 
-        let selected = self
-            .state
-            .selected()
-            .and_then(|i| self.rows.get(i))
-            .map(row_key);
+        self.recompute_visible();
 
-        let field = self.config.sort_field;
-        let direction = self.config.sort_direction;
-        self.rows
-            .sort_by(|left, right| compare_rows(left, right, field, direction));
-
-        if let Some(selected) = selected {
-            if let Some(index) = self.rows.iter().position(|row| row_key(row) == selected) {
-                self.state.select(Some(index));
+        // Re-anchor the selection onto the same row in the new visible set.
+        match selected {
+            Some(key) => {
+                let pos = self
+                    .visible
+                    .iter()
+                    .position(|&i| row_key(&self.rows[i]) == key);
+                match pos {
+                    Some(index) => self.state.select(Some(index)),
+                    // Previously selected row was filtered out: fall back to the top.
+                    None if !self.visible.is_empty() => self.state.select(Some(0)),
+                    None => self.state.select(None),
+                }
             }
+            None if self.visible.is_empty() => self.state.select(None),
+            None => {}
         }
     }
 
+    // Rebuild `visible` from the current rows and filter query.
+    fn recompute_visible(&mut self) {
+        self.visible = (0..self.rows.len())
+            .filter(|&i| fuzzy_match(&self.rows[i].name, &self.filter_query))
+            .collect();
+    }
+
+    // Select the first visible row when nothing is selected yet.
+    fn ensure_selection(&mut self) {
+        if self.state.selected().is_none() && !self.visible.is_empty() {
+            self.state.select(Some(0));
+        }
+    }
+
+    pub(crate) fn start_filter(&mut self) {
+        self.filtering = true;
+    }
+
+    pub(crate) fn filter_push_char(&mut self, c: char) {
+        self.filter_query.push(c);
+        self.apply_sort_preserve_selection();
+        self.ensure_selection();
+    }
+
+    pub(crate) fn filter_backspace(&mut self) {
+        self.filter_query.pop();
+        self.apply_sort_preserve_selection();
+        self.ensure_selection();
+    }
+
+    // Enter: keep the query, leave live-input mode.
+    pub(crate) fn filter_confirm(&mut self) {
+        self.filtering = false;
+    }
+
+    // Esc: drop the filter entirely and show every row again.
+    pub(crate) fn filter_clear(&mut self) {
+        self.filtering = false;
+        self.filter_query.clear();
+        self.apply_sort_preserve_selection();
+        self.ensure_selection();
+    }
+
     pub(crate) fn move_up(&mut self) {
-        if self.rows.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
         let i = self.state.selected().unwrap_or(0).saturating_sub(1);
@@ -270,10 +336,10 @@ impl App {
     }
 
     pub(crate) fn move_down(&mut self) {
-        if self.rows.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        let last = self.rows.len() - 1;
+        let last = self.visible.len() - 1;
         let i = self
             .state
             .selected()
@@ -284,23 +350,23 @@ impl App {
     }
 
     pub(crate) fn move_first(&mut self) {
-        if !self.rows.is_empty() {
+        if !self.visible.is_empty() {
             self.state.select(Some(0));
         }
     }
 
     pub(crate) fn move_last(&mut self) {
-        if let Some(last) = self.rows.len().checked_sub(1) {
+        if let Some(last) = self.visible.len().checked_sub(1) {
             self.state.select(Some(last));
         }
     }
 
     pub(crate) fn page_down(&mut self) {
-        if self.rows.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
         let page = self.list_height.max(1);
-        let last = self.rows.len() - 1;
+        let last = self.visible.len() - 1;
         let i = self
             .state
             .selected()
@@ -311,13 +377,31 @@ impl App {
     }
 
     pub(crate) fn page_up(&mut self) {
-        if self.rows.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
         let page = self.list_height.max(1);
         let i = self.state.selected().unwrap_or(0).saturating_sub(page);
         self.state.select(Some(i));
     }
+}
+
+// Case-insensitive subsequence match: every query char appears in order in `name`.
+// Empty query matches everything.
+fn fuzzy_match(name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut haystack = name.chars().map(|c| c.to_ascii_lowercase());
+    'next: for needle in query.chars().map(|c| c.to_ascii_lowercase()) {
+        for c in haystack.by_ref() {
+            if c == needle {
+                continue 'next;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 fn compare_rows(left: &Row, right: &Row, field: SortField, direction: SortDirection) -> Ordering {
@@ -385,6 +469,8 @@ mod tests {
                 ..row("OTHER", "c", None)
             },
         ];
+        // Mirror the runtime invariant: `visible` indexes `rows`, and `state` indexes `visible`.
+        app.visible = (0..app.rows.len()).collect();
         app.state.select(Some(1));
         app
     }
@@ -426,6 +512,45 @@ mod tests {
 
         let names: Vec<_> = app.rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["c", "a", "b.txt"]);
+    }
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive_subsequence() {
+        assert!(fuzzy_match("Cargo.toml", "ct"));
+        assert!(fuzzy_match("Cargo.toml", "CARGO"));
+        assert!(fuzzy_match("anything", ""));
+        assert!(!fuzzy_match("Cargo.toml", "tc")); // wrong order
+        assert!(!fuzzy_match("Cargo.toml", "xyz"));
+    }
+
+    #[test]
+    fn filter_narrows_visible_set() {
+        let mut app = app_with_rows(Config::default());
+
+        app.filter_query = "a".to_owned();
+        app.apply_sort_preserve_selection();
+
+        // Only "a.*"-matching names survive; here "a" (DIR) and "b.txt"? "b.txt" has no 'a'.
+        let visible: Vec<_> = app
+            .visible
+            .iter()
+            .map(|&i| app.rows[i].name.as_str())
+            .collect();
+        assert_eq!(visible, ["a"]);
+    }
+
+    #[test]
+    fn clearing_filter_restores_all_rows() {
+        let mut app = app_with_rows(Config::default());
+
+        app.filter_query = "zzz".to_owned();
+        app.apply_sort_preserve_selection();
+        assert!(app.visible.is_empty());
+        assert_eq!(app.state.selected(), None);
+
+        app.filter_clear();
+        assert_eq!(app.visible.len(), 3);
+        assert_eq!(app.state.selected(), Some(0));
     }
 
     #[test]

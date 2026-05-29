@@ -8,7 +8,7 @@
 
 - Default toolchain: `stable-x86_64-pc-windows-gnullvm` (self-contained; no Visual Studio Build Tools or MinGW required on Windows).
 - `.cargo/config.toml` pins `linker = "rust-lld"` and `rustflags = ["-C", "target-feature=+crt-static"]` so the release binary is statically linked and has no runtime DLL dependencies.
-- `build.rs` generates empty `ar` stub archives for Windows import libs that the gnullvm self-contained sysroot omits (`advapi32`, `cfgmgr32`, `gdi32`, `msimg32`, `opengl32`, `synchronization`, `winspool`). `crossterm`/`winapi` reference these via `#[link(name = "...")]` but never call into them on our code paths, so empty stubs satisfy `rust-lld` without pulling in MinGW. A future dep that actually calls into one of these DLLs will surface as an "undefined symbol" link error, signaling we need real import libs.
+- `build.rs` generates empty `ar` stub archives for Windows import libs that the gnullvm self-contained sysroot omits (`advapi32`, `cfgmgr32`, `credui`, `gdi32`, `msimg32`, `opengl32`, `secur32`, `synchronization`, `winspool`). `crossterm`/`winapi` reference these via `#[link(name = "...")]` but never call into them on our code paths, so empty stubs satisfy `rust-lld` without pulling in MinGW. A future dep that actually calls into one of these DLLs will surface as an "undefined symbol" link error, signaling we need real import libs.
 - First-time setup on a new machine: `rustup toolchain install stable-x86_64-pc-windows-gnullvm && rustup default stable-x86_64-pc-windows-gnullvm`.
 
 ## Commands
@@ -49,7 +49,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 
 - Launches a full-screen interactive list. Selection starts on the first row as soon as the first entry streams in; the scan continues in the background and pushes rows into the list via an `mpsc` channel.
 - Layout: `title | header | list | system status | footer`. Title shows `rll  <current path>` and either `scanning…` or the final entry count. System status shows process CPU and RAM MB once per second. Footer shows the `TOTAL` summary once the scan completes plus the keybinding hint.
-- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `Enter/l` open selected directory, `Backspace/h` parent directory, `r` reload current directory, `c` settings, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Keys: `↑/k` up, `↓/j` down, `Home/g` first, `End/G` last, `PgUp/u` page up, `PgDn/d` page down, `Enter/l` open selected directory, `Backspace/h` parent directory, `r` reload current directory, `c` settings, `/` fuzzy filter, `o` open selected with OS default app, `e` reveal in file manager, `y` copy selected path to clipboard, `q`/`Esc`/`Ctrl-C` quit. Press events only (avoids duplicate moves on Windows key-release).
+- Fuzzy filter: `/` enters live-input mode; typed chars build a case-insensitive subsequence query matched against entry names. Enter applies and exits input mode (list stays filtered), Esc clears the filter. Navigation/selection operate on the filtered set via `App.visible` (indices into `rows`); the title shows `<visible>/<total> match /<query>`. Filter resets on every directory change/reload.
+- List columns: `TYPE | SIZE | % | GRAPH | NAME`. `%` is each entry's share of the visible total; `GRAPH` is an ncdu-style proportional bar relative to the largest visible entry. Both denominators are computed over the filtered view so a filter rescales them.
+- OS actions (`o`/`e`/`y`) shell out via `std::process::Command` only — no extra crates — and report success/error on the footer status line. Windows uses `cmd /C start`, `explorer /select,`, and `clip`; other platforms fall back to `xdg-open`/`open` and `xclip`/`pbcopy`.
 - Settings screen: `Enter`/`Space` cycles values, `s` saves, `Esc` cancels; supports hidden files plus sort field `unsorted|name|size|type` and direction `asc|desc`.
 - TUI settings persist in `%APPDATA%\rll\config` on Windows, `$XDG_CONFIG_HOME/rll/config` or `$HOME/.config/rll/config` elsewhere; `rll tui --a` overrides hidden files for that session only.
 - Parent navigation may leave the launch directory; crossing above the initial root shows an in-TUI confirmation modal (`y`/`Enter` confirm, `n`/`Esc` cancel).
@@ -71,10 +74,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/measure_windows.
 - Cross-module reuse: `cli`, `scan`, and `format` items the TUI and output paths share are `pub(crate)`; the TUI submodules import the scan + format layer directly via `crate::scan::*` / `crate::format::*`.
 - `src/tui/`: ratatui + crossterm interactive mode, split into submodules:
   - `mod.rs`: `pub(crate) run`, terminal lifecycle (raw mode, alternate screen, panic hook), channel setup, and initial root capture.
-  - `app.rs`: `App` UI state, `Row`, cached directory snapshots, confirm-modal state, and list-selection navigation (`move_*`/`page_*`). No ratatui drawing.
-  - `render.rs`: `render(frame, app)` — the `title | header | list | system status | footer` ratatui layout plus confirmation modal overlay.
-  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle, 1s process CPU/RAM sampling), scan spawning, stale `scan_id` filtering, directory navigation, reload, and key mapping.
+  - `app.rs`: `App` UI state, `Row`, cached directory snapshots, confirm-modal state, fuzzy-filter state (`filtering`/`filter_query`/`visible` + `fuzzy_match`), and list-selection navigation (`move_*`/`page_*`, all indexing `visible`). No ratatui drawing.
+  - `render.rs`: `render(frame, app)` — the `title | header | list | system status | footer` ratatui layout (incl. the `%`/`GRAPH` columns via `size_percent`/`size_bar`, `BAR_WIDTH`), the filter input footer, plus confirmation modal overlay.
+  - `event.rs`: `event_loop` (scan-event drain, ~30fps throttle, 1s process CPU/RAM sampling), scan spawning, stale `scan_id` filtering, directory navigation, reload, key mapping, `handle_filter_key`, and OS-action dispatch (`run_action`).
   - `scan.rs`: `ScanEvent` protocol and path-aware `scan_into_channel` background thread bridging `crate::scan` into the UI.
+  - `actions.rs`: std-only OS integration — `open_path`/`reveal_path`/`copy_path` via `std::process::Command`, gated by `cfg(windows)` vs unix fallbacks.
 - `build.rs`: writes empty `ar` stub archives for gnullvm-missing import libs (see Toolchain).
 - `tests/cli.rs`: integration tests through compiled `rll` binary; use temp dirs for deterministic file sizes and ordering assertions.
 - `scripts/check_perf.rs`: std-only wall-time and binary-size check.

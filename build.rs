@@ -34,9 +34,11 @@ fn main() {
     const MISSING: &[&str] = &[
         "advapi32",
         "cfgmgr32",
+        "credui",
         "gdi32",
         "msimg32",
         "opengl32",
+        "secur32",
         "synchronization",
         "winspool",
     ];

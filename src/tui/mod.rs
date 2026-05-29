@@ -11,6 +11,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
+mod actions;
 mod app;
 mod event;
 mod render;

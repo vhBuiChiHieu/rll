@@ -11,6 +11,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::Terminal;
 use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+use super::actions;
 use super::app::{App, ConfirmLeaveRoot, SettingsAction, SystemStatus, ViewMode};
 use super::render::render;
 use super::scan::{scan_into_channel, ScanEvent};
@@ -178,6 +179,9 @@ fn handle_key(app: &mut App, tx: &mpsc::Sender<ScanEvent>, key: KeyEvent) -> Key
     if app.view == ViewMode::Settings {
         return handle_settings_key(app, tx, key);
     }
+    if app.filtering {
+        return handle_filter_key(app, key);
+    }
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
@@ -234,6 +238,62 @@ fn handle_key(app: &mut App, tx: &mpsc::Sender<ScanEvent>, key: KeyEvent) -> Key
         }
         KeyCode::Char('c') => {
             app.open_settings();
+            KeyAction::Dirty
+        }
+        KeyCode::Char('/') => {
+            app.start_filter();
+            KeyAction::Dirty
+        }
+        KeyCode::Char('o') => run_action(app, Action::Open),
+        KeyCode::Char('e') => run_action(app, Action::Reveal),
+        KeyCode::Char('y') => run_action(app, Action::Copy),
+        _ => KeyAction::None,
+    }
+}
+
+enum Action {
+    Open,
+    Reveal,
+    Copy,
+}
+
+// Run an OS action on the selected row and surface the result in the footer status line.
+fn run_action(app: &mut App, action: Action) -> KeyAction {
+    let Some(path) = app.selected_row().map(|row| row.path.clone()) else {
+        app.status = Some("no selection".to_owned());
+        return KeyAction::Dirty;
+    };
+    let result = match action {
+        Action::Open => actions::open_path(&path),
+        Action::Reveal => actions::reveal_path(&path),
+        Action::Copy => actions::copy_path(&path),
+    };
+    app.status = Some(match result {
+        Ok(label) => format!("{label}: {}", path.display()),
+        Err(err) => format!("error: {err}"),
+    });
+    KeyAction::Dirty
+}
+
+// Live filter input mode (entered via `/`). All typed chars build the query;
+// Enter applies and exits input mode, Esc clears the filter entirely.
+fn handle_filter_key(app: &mut App, key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Quit,
+        KeyCode::Esc => {
+            app.filter_clear();
+            KeyAction::Dirty
+        }
+        KeyCode::Enter => {
+            app.filter_confirm();
+            KeyAction::Dirty
+        }
+        KeyCode::Backspace => {
+            app.filter_backspace();
+            KeyAction::Dirty
+        }
+        KeyCode::Char(c) => {
+            app.filter_push_char(c);
             KeyAction::Dirty
         }
         _ => KeyAction::None,
