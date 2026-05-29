@@ -104,7 +104,7 @@ fn render_list(f: &mut Frame, app: &mut App) {
             let type_color = match r.type_name {
                 "DIR" => Color::Cyan,
                 "FILE" => Color::White,
-                _ => Color::DarkGray,
+                _ => Color::Gray,
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -112,9 +112,11 @@ fn render_list(f: &mut Frame, app: &mut App) {
                     Style::default().fg(type_color),
                 ),
                 Span::raw(" "),
-                Span::styled(format!("{size:<10}"), Style::default().fg(Color::DarkGray)),
+                // Use Gray (not DarkGray) so these dim columns stay visible against
+                // the DarkGray selection highlight bg below.
+                Span::styled(format!("{size:<10}"), Style::default().fg(Color::Gray)),
                 Span::raw(" "),
-                Span::styled(pct, Style::default().fg(Color::DarkGray)),
+                Span::styled(pct, Style::default().fg(Color::Gray)),
                 Span::raw(" "),
                 Span::styled(bar, Style::default().fg(Color::Blue)),
                 Span::raw(" "),
